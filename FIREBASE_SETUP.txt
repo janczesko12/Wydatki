@@ -1,0 +1,32 @@
+FIREBASE – JEDNORAZOWA KONFIGURACJA
+
+Aplikacja jest przygotowana do synchronizacji z Firestore.
+Żeby chmura działała po usunięciu i ponownej instalacji aplikacji, potrzebne jest konto Firebase Authentication (e-mail + hasło). Samo konto anonimowe nie wystarcza, bo po odinstalowaniu aplikacji jego identyfikator nie jest gwarantowany.
+
+1. Utwórz projekt w Firebase Console.
+2. Dodaj aplikację Android z pakietem:
+   com.example.wydatki
+3. Włącz Authentication -> Sign-in method -> Email/Password.
+4. Utwórz Firestore Database.
+5. Ustaw reguły z pliku firestore.rules.
+6. Firebase Console -> ustawienia projektu -> aplikacja Android -> odczytaj:
+   API key
+   App ID
+   Project ID
+7. W app/build.gradle.kts ustaw:
+   FIREBASE_API_KEY
+   FIREBASE_APP_ID
+   FIREBASE_PROJECT_ID
+8. W GitHub ustaw:
+   GITHUB_OWNER
+   GITHUB_REPO
+9. Zbuduj APK.
+
+Po pierwszym uruchomieniu:
+Ustawienia -> Synchronizacja z chmurą -> UTWÓRZ KONTO.
+Potem każde dodanie/edycja/usunięcie danych zapisuje dane lokalnie i wysyła pełny stan do Firestore.
+
+Po usunięciu aplikacji:
+zainstaluj ponownie -> zaloguj się tym samym e-mailem i hasłem -> dane zostaną pobrane z Firestore.
+
+Dodatkowo można używać Eksportuj/Importuj JSON jako niezależnej kopii zapasowej.
