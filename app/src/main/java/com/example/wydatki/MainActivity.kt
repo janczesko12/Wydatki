@@ -3,11 +3,16 @@ package com.example.wydatki
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings as AndroidSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricPrompt
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
@@ -33,6 +38,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -42,10 +48,20 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Backspace
+import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.CalendarMonth
+import androidx.compose.material.icons.filled.PieChart
+import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -53,14 +69,17 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.Surface
+import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.animation.animateContentSize
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
@@ -68,7 +87,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
@@ -94,7 +115,7 @@ data class Expense(val id: String, val categoryId: String, val amount: Double, v
 data class Income(val id: String, val source: String, val amount: Double, val date: String, val note: String = "")
 data class ReleaseInfo(val tag: String, val apkUrl: String)
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     private lateinit var store: AppStore
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -119,6 +140,10 @@ class AppStore(context: Context) {
     var incomes by mutableStateOf(loadIncomes())
         private set
     var cloudStatus by mutableStateOf("Chmura: przygotowywanie…")
+        private set
+    var securityPin by mutableStateOf(prefs?.getString("security_pin", null))
+        private set
+    var biometricEnabled by mutableStateOf(prefs?.getBoolean("biometric_enabled", false) ?: false)
         private set
 
     init {
@@ -175,6 +200,16 @@ class AppStore(context: Context) {
 
     fun updateCloudStatus(value: String) {
         cloudStatus = value
+    }
+
+    fun setPin(pin: String?) {
+        securityPin = pin
+        prefs?.edit()?.putString("security_pin", pin)?.apply()
+    }
+
+    fun setBiometric(enabled: Boolean) {
+        biometricEnabled = enabled
+        prefs?.edit()?.putBoolean("biometric_enabled", enabled)?.apply()
     }
 
     fun exportJson(): String {
@@ -356,7 +391,7 @@ class AppStore(context: Context) {
     }
 
     private fun defaultCategories() = listOf(
-        Category("oplaty", "Opłaty", "🏠", 0), Category("gaz", "Gaz za cały dom", "🔥", 1),
+        Category("oplaty", "Opłaty Dom", "🏠", 0), Category("gaz", "Gaz za cały dom", "🔥", 1),
         Category("jedzenie", "Jedzenie", "🛒", 2), Category("auto", "Auto", "🚗", 3),
         Category("uroda", "Uroda", "💄", 4), Category("rozrywka", "Rozrywka", "🎮", 5),
         Category("szkola", "Szkoła", "🎓", 6), Category("dom", "Art. do domu", "🏡", 7),
@@ -553,16 +588,157 @@ object FirebaseCloud {
     }
 }
 
+fun authenticateBiometric(activity: FragmentActivity, onSuccess: () -> Unit) {
+    val executor = ContextCompat.getMainExecutor(activity)
+    val biometricPrompt = BiometricPrompt(activity, executor,
+        object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                super.onAuthenticationSucceeded(result)
+                onSuccess()
+            }
+        })
+
+    val promptInfo = BiometricPrompt.PromptInfo.Builder()
+        .setTitle("Logowanie")
+        .setSubtitle("Użyj biometrii, aby uzyskać dostęp")
+        .setNegativeButtonText("Użyj PINu")
+        .build()
+
+    try {
+        biometricPrompt.authenticate(promptInfo)
+    } catch (_: Exception) {
+    }
+}
+
+@Composable
+fun SecurityScreen(store: AppStore, onUnlocked: () -> Unit) {
+    var pinInput by remember { mutableStateOf("") }
+    val context = LocalContext.current.findActivity()
+
+    LaunchedEffect(Unit) {
+        if (store.biometricEnabled && context != null) {
+            authenticateBiometric(context) { onUnlocked() }
+        }
+    }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Color.White)
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            Icons.Default.Lock,
+            null,
+            Modifier.size(64.dp),
+            tint = Color(0xFF278B68)
+        )
+        Spacer(Modifier.height(24.dp))
+        Text(
+            "Wprowadź PIN",
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color(0xFF263238)
+        )
+        Spacer(Modifier.height(16.dp))
+
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            repeat(4) { index ->
+                Box(
+                    Modifier
+                        .size(16.dp)
+                        .background(
+                            if (index < pinInput.length) Color(0xFF278B68) else Color(0xFFE0E0E0),
+                            CircleShape
+                        )
+                )
+            }
+        }
+
+        Spacer(Modifier.height(48.dp))
+
+        val numbers = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "DEL")
+        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            numbers.chunked(3).forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    row.forEach { num ->
+                        if (num.isEmpty()) {
+                            if (store.biometricEnabled) {
+                                IconButton(
+                                    onClick = { context?.let { authenticateBiometric(it) { onUnlocked() } } },
+                                    modifier = Modifier.size(64.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.Fingerprint,
+                                        null,
+                                        Modifier.size(40.dp),
+                                        tint = Color(0xFF278B68)
+                                    )
+                                }
+                            } else {
+                                Spacer(Modifier.size(64.dp))
+                            }
+                        } else {
+                            Box(
+                                Modifier
+                                    .size(64.dp)
+                                    .background(Color(0xFFF5F7F6), CircleShape)
+                                    .clickable {
+                                        if (num == "DEL") {
+                                            if (pinInput.isNotEmpty()) pinInput = pinInput.dropLast(1)
+                                        } else if (pinInput.length < 4) {
+                                            pinInput += num
+                                            if (pinInput.length == 4) {
+                                                if (pinInput == store.securityPin) onUnlocked()
+                                                else pinInput = ""
+                                            }
+                                        }
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (num == "DEL") Icon(Icons.Default.Backspace, null, tint = Color(0xFF546E7A))
+                                else Text(
+                                    num,
+                                    fontSize = 26.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF263238)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
 @Composable
 fun WydatkiApp(store: AppStore) {
+    var isLocked by remember { mutableStateOf(store.securityPin != null) }
+
+    if (isLocked) {
+        SecurityScreen(store) { isLocked = false }
+        return
+    }
+
     var screen by remember { mutableStateOf("dashboard") }
     var selected by remember { mutableStateOf<Category?>(null) }
     var month by remember { mutableStateOf(currentMonth()) }
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var availableRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
+    var updateDownloading by remember { mutableStateOf(false) }
+    var updateProgress by remember { mutableStateOf(0) }
+    var updateError by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
-        val release = GithubUpdater.check()
-        if (release != null) GithubUpdater.downloadAndInstall(context, release)
+        availableRelease = GithubUpdater.check()
     }
 
     val selectedTab = when (screen) {
@@ -606,6 +782,95 @@ fun WydatkiApp(store: AppStore) {
         // Stała nawigacja — widoczna również wewnątrz Wydatków,
         // Dochodów, Statystyk, Wyszukiwania i Ustawień.
         BottomBar({ screen = it }, selectedTab)
+    }
+
+    // Ekran aktualizacji pojawia się przed uruchomieniem instalatora Androida.
+    availableRelease?.let { release ->
+        AlertDialog(
+            onDismissRequest = {
+                if (!updateDownloading) availableRelease = null
+            },
+            title = { Text("🚀 Nowa wersja dostępna") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Dostępna jest nowa wersja aplikacji Wydatki.")
+                    Text(
+                        "Wersja ${release.tag}",
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (updateError.isNotBlank()) {
+                        Text(updateError, color = Color.Red, fontSize = 12.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !updateDownloading,
+                    onClick = {
+                        updateDownloading = true
+                        updateProgress = 0
+                        updateError = ""
+
+                        scope.launch {
+                            val success = GithubUpdater.downloadAndInstall(
+                                context,
+                                release,
+                                onProgress = { updateProgress = it }
+                            )
+
+                            updateDownloading = false
+
+                            if (success) {
+                                availableRelease = null
+                            } else {
+                                updateError = "Nie udało się pobrać aktualizacji."
+                            }
+                        }
+                    }
+                ) {
+                    Text(if (updateDownloading) "POBIERANIE…" else "AKTUALIZUJ")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !updateDownloading,
+                    onClick = { availableRelease = null }
+                ) {
+                    Text("PÓŹNIEJ")
+                }
+            }
+        )
+    }
+
+    if (updateDownloading) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Pobieranie aktualizacji") },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    CircularProgressIndicator()
+                    Text(
+                        "$updateProgress%",
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    LinearProgressIndicator(
+                        progress = { updateProgress / 100f },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "Pobieram nową wersję aplikacji…",
+                        fontSize = 12.sp,
+                        color = Color.Gray
+                    )
+                }
+            },
+            confirmButton = {}
+        )
     }
 }
 
@@ -749,7 +1014,7 @@ fun SummarySection(income: Double, expenses: Double, remaining: Double) {
     }
     Spacer(Modifier.height(8.dp)); SummaryCard(
         Modifier.fillMaxWidth(),
-        "ZOSTAŁO",
+        "POZOSTAŁO",
         remaining,
         Color(0xFFE5F1F8),
         Color(0xFF156082)
@@ -846,6 +1111,7 @@ fun CategoryScreen(store: AppStore, c: Category, month: String, back: () -> Unit
     }
     if (dialog) ExpenseDialog(
         c,
+        month,
         editing,
         {
             dialog = false
@@ -891,6 +1157,7 @@ fun ExpenseCard(e: Expense, edit: () -> Unit, delete: () -> Unit) {
 @Composable
 fun ExpenseDialog(
     c: Category,
+    month: String,
     initial: Expense?,
     dismiss: () -> Unit,
     save: (Expense) -> Unit
@@ -901,9 +1168,12 @@ fun ExpenseDialog(
         )
     }
     var desc by remember { mutableStateOf(initial?.description ?: "") }
-    var date by remember { mutableStateOf(initial?.date ?: today()) }
+    var date by remember {
+        mutableStateOf(initial?.date ?: "$month-01")
+    }
     var note by remember { mutableStateOf(initial?.note ?: "") }
     var error by remember { mutableStateOf("") }
+    var showDatePicker by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = dismiss,
         title = { Text(if (initial == null) "Dodaj wydatek" else "Edytuj wydatek") },
@@ -914,25 +1184,42 @@ fun ExpenseDialog(
                     { amount = it },
                     label = { Text("Kwota") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     desc,
                     { desc = it },
                     label = { Text("Opis") },
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     date,
                     { date = it },
-                    label = { Text("Data RRRR-MM-DD") },
-                    singleLine = true
+                    label = { Text("Data") },
+                    singleLine = true,
+                    readOnly = true,
+                    modifier = Modifier.fillMaxWidth().clickable { showDatePicker = true },
+                    trailingIcon = {
+                        IconButton({ showDatePicker = true }) {
+                            Icon(Icons.Default.CalendarMonth, null)
+                        }
+                    },
+                    enabled = false,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        disabledTextColor = Color.Black,
+                        disabledBorderColor = Color.LightGray,
+                        disabledLabelColor = Color.Gray,
+                        disabledTrailingIconColor = Color(0xFF278B68)
+                    )
                 )
                 OutlinedTextField(
                     note,
                     { note = it },
                     label = { Text("Notatka") },
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
                 ); if (error.isNotBlank()) Text(error, color = Color.Red, fontSize = 12.sp)
             }
         },
@@ -954,6 +1241,23 @@ fun ExpenseDialog(
             }) { Text("ZAPISZ") }
         },
         dismissButton = { TextButton(dismiss) { Text("ANULUJ") } })
+
+    if (showDatePicker) {
+        val state = rememberDatePickerState()
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                TextButton({
+                    state.selectedDateMillis?.let {
+                        date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(it))
+                    }
+                    showDatePicker = false
+                }) { Text("OK") }
+            }
+        ) {
+            DatePicker(state)
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1005,6 +1309,7 @@ fun ExpensesScreen(store: AppStore, month: String, back: () -> Unit) {
         val c = store.categories.firstOrNull { it.id == editing?.categoryId }
             ?: store.categories.first(); ExpenseDialog(
             c,
+            month,
             editing,
             { dialog = false }) {
             if (editing == null) store.addExpense(it) else store.updateExpense(it); dialog =
@@ -1013,22 +1318,40 @@ fun ExpensesScreen(store: AppStore, month: String, back: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit, back: () -> Unit) {
-    var selectedYear by remember { mutableStateOf(month.substring(0, 4).toInt()) }
-    LaunchedEffect(month) { selectedYear = month.substring(0, 4).toInt() }
-    val ex = store.expenses.filter { monthOf(it.date).startsWith("$selectedYear-") }
-    val income = store.incomes.filter { monthOf(it.date).startsWith("$selectedYear-") }.sumOf { it.amount }
-    val total = ex.sumOf { it.amount }
+    var viewMode by remember { mutableStateOf("year") } // "year" or "period"
+    var selectedYear by remember { mutableIntStateOf(month.substring(0, 4).toInt()) }
+    
+    var startDate by remember { mutableStateOf(today()) }
+    var endDate by remember { mutableStateOf(today()) }
+    var datePickerTarget by remember { mutableStateOf<String?>(null) }
 
-    val selectedMonthExpenses = store.expenses.filter { monthOf(it.date) == month }
-    val monthTotal = selectedMonthExpenses.sumOf { it.amount }
-    val monthIncome = store.incomes.filter { monthOf(it.date) == month }.sumOf { it.amount }
+    val expenses = if (viewMode == "year") {
+        store.expenses.filter { monthOf(it.date).startsWith("$selectedYear-") }
+    } else {
+        store.expenses.filter { it.date in startDate..endDate }
+    }
+    
+    val income = if (viewMode == "year") {
+        store.incomes.filter { monthOf(it.date).startsWith("$selectedYear-") }.sumOf { it.amount }
+    } else {
+        store.incomes.filter { it.date in startDate..endDate }.sumOf { it.amount }
+    }
+    
+    val total = expenses.sumOf { it.amount }
+
     val grouped = store.categories.map { category ->
-        category to selectedMonthExpenses.filter { it.categoryId == category.id }.sumOf { it.amount }
+        category to expenses.filter { it.categoryId == category.id }.sumOf { it.amount }
     }.filter { it.second > 0 }.sortedByDescending { it.second }
-    val avg = if (selectedMonthExpenses.isEmpty()) 0.0
-    else monthTotal / selectedMonthExpenses.map { it.date }.distinct().size
+
+    val monthExpenses = store.expenses.filter { monthOf(it.date) == month }
+    val monthTotal = monthExpenses.sumOf { it.amount }
+    val monthIncome = store.incomes.filter { monthOf(it.date) == month }.sumOf { it.amount }
+    
+    val avg = if (expenses.isEmpty()) 0.0
+    else total / expenses.map { it.date }.distinct().size
 
     Column(Modifier.fillMaxSize().background(Color(0xFFF6F8F7))) {
         Row(
@@ -1044,6 +1367,29 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold
             )
+            Spacer(Modifier.weight(1f))
+            Row(
+                Modifier
+                    .background(Color(0xFFE0E0E0), RoundedCornerShape(20.dp))
+                    .padding(2.dp)
+            ) {
+                listOf("year" to Icons.Default.CalendarMonth, "period" to Icons.Default.BarChart).forEach { (m, icon) ->
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(if (viewMode == m) Color.White else Color.Transparent)
+                            .clickable { viewMode = m }
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            icon,
+                            null,
+                            Modifier.size(18.dp),
+                            tint = if (viewMode == m) Color(0xFF278B68) else Color.Gray
+                        )
+                    }
+                }
+            }
         }
 
         LazyColumn(
@@ -1058,29 +1404,62 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                     shape = RoundedCornerShape(16.dp)
                 ) {
                     Column(Modifier.padding(14.dp)) {
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text("ROK", fontWeight = FontWeight.Bold, color = Color(0xFF455A64))
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton({ selectedYear-- }) {
-                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Poprzedni rok")
+                        if (viewMode == "year") {
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("ROK", fontWeight = FontWeight.Bold, color = Color(0xFF455A64))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton({ selectedYear-- }) {
+                                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Poprzedni rok")
+                                    }
+                                    Text(
+                                        "$selectedYear",
+                                        fontSize = 18.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    IconButton({ selectedYear++ }) {
+                                        Icon(Icons.AutoMirrored.Filled.ArrowForwardIos, "Następny rok")
+                                    }
                                 }
-                                Text(
-                                    "$selectedYear",
-                                    fontSize = 18.sp,
-                                    fontWeight = FontWeight.Bold
+                            }
+                        } else {
+                            Text("WYBRANY OKRES", fontWeight = FontWeight.Bold, color = Color(0xFF455A64))
+                            Spacer(Modifier.height(8.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedTextField(
+                                    startDate,
+                                    {},
+                                    readOnly = true,
+                                    modifier = Modifier.weight(1f).clickable { datePickerTarget = "start" },
+                                    label = { Text("Od") },
+                                    enabled = false,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        disabledTextColor = Color.Black,
+                                        disabledBorderColor = Color.LightGray,
+                                        disabledLabelColor = Color.Gray
+                                    )
                                 )
-                                IconButton({ selectedYear++ }) {
-                                    Icon(Icons.AutoMirrored.Filled.ArrowForwardIos, "Następny rok")
-                                }
+                                OutlinedTextField(
+                                    endDate,
+                                    {},
+                                    readOnly = true,
+                                    modifier = Modifier.weight(1f).clickable { datePickerTarget = "end" },
+                                    label = { Text("Do") },
+                                    enabled = false,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        disabledTextColor = Color.Black,
+                                        disabledBorderColor = Color.LightGray,
+                                        disabledLabelColor = Color.Gray
+                                    )
+                                )
                             }
                         }
 
-                        Spacer(Modifier.height(4.dp))
-                        Text("SUMA ROKU", fontSize = 12.sp, color = Color.Gray)
+                        Spacer(Modifier.height(12.dp))
+                        Text(if (viewMode == "year") "SUMA ROKU" else "SUMA OKRESU", fontSize = 12.sp, color = Color.Gray)
                         Text(
                             money(total),
                             fontSize = 25.sp,
@@ -1096,86 +1475,113 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                 }
             }
 
-            item {
-                Text("MIESIĄCE • $selectedYear", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            }
+            if (viewMode == "year") {
+                item {
+                    Text("MIESIĄCE • $selectedYear", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                }
 
-            items((1..12).toList()) { monthNumber ->
-                val ym = String.format(Locale.US, "%04d-%02d", selectedYear, monthNumber)
-                val mExpenses = store.expenses.filter { monthOf(it.date) == ym }.sumOf { it.amount }
-                val mIncome = store.incomes.filter { monthOf(it.date) == ym }.sumOf { it.amount }
-                val active = ym == month
+                items((1..12).toList()) { monthNumber ->
+                    val ym = String.format(Locale.US, "%04d-%02d", selectedYear, monthNumber)
+                    val mExpenses = store.expenses.filter { monthOf(it.date) == ym }.sumOf { it.amount }
+                    val mIncome = store.incomes.filter { monthOf(it.date) == ym }.sumOf { it.amount }
+                    val active = ym == month
 
-                Card(
-                    Modifier.fillMaxWidth().clickable { setMonth(ym) },
-                    colors = CardDefaults.cardColors(if (active) Color(0xFFE8F4EE) else Color.White),
-                    shape = RoundedCornerShape(14.dp)
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    Card(
+                        Modifier.fillMaxWidth().clickable { setMonth(ym) },
+                        colors = CardDefaults.cardColors(if (active) Color(0xFFE8F4EE) else Color.White),
+                        shape = RoundedCornerShape(14.dp)
                     ) {
-                        Text(
-                            monthLabel(ym).replace("$selectedYear", "").trim(),
-                            Modifier.weight(1f),
-                            fontWeight = if (active) FontWeight.Bold else FontWeight.Medium
-                        )
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(money(mExpenses), fontWeight = FontWeight.Bold, color = Color(0xFFC62828))
-                            if (mIncome > 0) Text(
-                                "dochód ${money(mIncome)}",
-                                fontSize = 11.sp,
-                                color = Color(0xFF087443)
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                monthLabel(ym).replace("$selectedYear", "").trim(),
+                                Modifier.weight(1f),
+                                fontWeight = if (active) FontWeight.Bold else FontWeight.Medium
                             )
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(money(mExpenses), fontWeight = FontWeight.Bold, color = Color(0xFFC62828))
+                                if (mIncome > 0) Text(
+                                    "dochód ${money(mIncome)}",
+                                    fontSize = 11.sp,
+                                    color = Color(0xFF087443)
+                                )
+                            }
                         }
                     }
                 }
             }
 
             item {
-                Text("SZCZEGÓŁY • ${monthLabel(month)}", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text(
+                    if (viewMode == "year") "SZCZEGÓŁY • ${monthLabel(month)}" else "SZCZEGÓŁY OKRESU",
+                    fontWeight = FontWeight.Bold, fontSize = 16.sp
+                )
             }
 
-            item {
-                SummaryCard(
-                    Modifier.fillMaxWidth(),
-                    "WYDATKI",
-                    monthTotal,
-                    Color(0xFFFCE7E5),
-                    Color(0xFFC62828)
-                )
-            }
-            item {
-                SummaryCard(
-                    Modifier.fillMaxWidth(),
-                    "ŚREDNIO / DZIEŃ",
-                    avg,
-                    Color(0xFFE5F1F8),
-                    Color(0xFF156082)
-                )
-            }
-            item {
-                SummaryCard(
-                    Modifier.fillMaxWidth(),
-                    "DOCHÓD",
-                    monthIncome,
-                    Color(0xFFE2F4E9),
-                    Color(0xFF087443)
-                )
+            if (viewMode == "year") {
+                item {
+                    SummaryCard(
+                        Modifier.fillMaxWidth(),
+                        "WYDATKI",
+                        monthTotal,
+                        Color(0xFFFCE7E5),
+                        Color(0xFFC62828)
+                    )
+                }
+                item {
+                    SummaryCard(
+                        Modifier.fillMaxWidth(),
+                        "ŚREDNIO / DZIEŃ",
+                        if (monthExpenses.isEmpty()) 0.0 else monthTotal / monthExpenses.map { it.date }.distinct().size,
+                        Color(0xFFE5F1F8),
+                        Color(0xFF156082)
+                    )
+                }
+                item {
+                    SummaryCard(
+                        Modifier.fillMaxWidth(),
+                        "DOCHÓD",
+                        monthIncome,
+                        Color(0xFFE2F4E9),
+                        Color(0xFF087443)
+                    )
+                }
+            } else {
+                item {
+                    SummaryCard(
+                        Modifier.fillMaxWidth(),
+                        "ŚREDNIO / DZIEŃ",
+                        avg,
+                        Color(0xFFE5F1F8),
+                        Color(0xFF156082)
+                    )
+                }
             }
 
             item {
                 Text("PODZIAŁ WYDATKÓW", fontWeight = FontWeight.Bold, fontSize = 16.sp)
             }
 
-            if (grouped.isNotEmpty()) {
+            val displayGrouped = if (viewMode == "year") {
+                store.categories.map { category ->
+                    category to monthExpenses.filter { it.categoryId == category.id }.sumOf { it.amount }
+                }.filter { it.second > 0 }.sortedByDescending { it.second }
+            } else {
+                grouped
+            }
+            
+            val displayTotal = if (viewMode == "year") monthTotal else total
+
+            if (displayGrouped.isNotEmpty()) {
                 item {
                     ExpensePieChart(
-                        grouped = grouped,
-                        total = monthTotal
+                        grouped = displayGrouped,
+                        total = displayTotal
                     )
                 }
-                items(grouped) { (c, v) ->
+                items(displayGrouped) { (c, v) ->
                     Card(
                         Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(Color.White)
@@ -1190,7 +1596,7 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                             }
                             Spacer(Modifier.height(5.dp))
                             Text(
-                                "${if (monthTotal > 0) (v / monthTotal * 100).toInt() else 0}% wszystkich wydatków",
+                                "${if (displayTotal > 0) (v / displayTotal * 100).toInt() else 0}% wszystkich wydatków",
                                 fontSize = 12.sp,
                                 color = Color.Gray
                             )
@@ -1198,8 +1604,26 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                     }
                 }
             } else {
-                item { Empty("Brak wydatków w tym miesiącu.") }
+                item { Empty("Brak wydatków.") }
             }
+        }
+    }
+    
+    if (datePickerTarget != null) {
+        val state = rememberDatePickerState()
+        DatePickerDialog(
+            onDismissRequest = { datePickerTarget = null },
+            confirmButton = {
+                TextButton({
+                    state.selectedDateMillis?.let {
+                        val d = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(it))
+                        if (datePickerTarget == "start") startDate = d else endDate = d
+                    }
+                    datePickerTarget = null
+                }) { Text("OK") }
+            }
+        ) {
+            DatePicker(state)
         }
     }
 }
@@ -1295,7 +1719,7 @@ fun IncomeScreen(store: AppStore, month: String, back: () -> Unit) {
             }; if (list.isEmpty()) item { Empty("Brak dochodów.") }
         }
     }
-    if (dialog) IncomeDialog(editing,
+    if (dialog) IncomeDialog(editing, month,
         { dialog = false }) {
         if (editing == null) store.addIncome(it) else store.updateIncome(
             it
@@ -1332,52 +1756,102 @@ fun IncomeCard(i: Income, edit: () -> Unit, delete: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun IncomeDialog(initial: Income?, dismiss: () -> Unit, save: (Income) -> Unit) {
+fun IncomeDialog(initial: Income?, month: String, dismiss: () -> Unit, save: (Income) -> Unit) {
     var source by remember { mutableStateOf(initial?.source ?: "") }
     var amount by remember {
         mutableStateOf(
             initial?.amount?.toString()?.replace('.', ',') ?: ""
         )
     }
-    var date by remember { mutableStateOf(initial?.date ?: today()) }
+    var date by remember {
+        mutableStateOf(
+            initial?.date ?: run {
+                val t = today()
+                if (monthOf(t) == month) t else "$month-01"
+            }
+        )
+    }
     var error by remember { mutableStateOf("") }
+    var showDatePicker by remember { mutableStateOf(false) }
+
     AlertDialog(
         onDismissRequest = dismiss,
         title = { Text(if (initial == null) "Dodaj dochód" else "Edytuj dochód") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
+                    amount,
+                    { amount = it },
+                    label = { Text("Kwota") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
                     source,
                     { source = it },
-                    label = { Text("Źródło") },
-                    singleLine = true
-                ); OutlinedTextField(
-                amount,
-                { amount = it },
-                label = { Text("Kwota") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                singleLine = true
-            ); OutlinedTextField(
-                date,
-                { date = it },
-                label = { Text("Data RRRR-MM-DD") },
-                singleLine = true
-            ); if (error.isNotBlank()) Text(error, color = Color.Red)
+                    label = { Text("Opis") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    date,
+                    { date = it },
+                    label = { Text("Data") },
+                    singleLine = true,
+                    readOnly = true,
+                    modifier = Modifier.fillMaxWidth().clickable { showDatePicker = true },
+                    trailingIcon = {
+                        IconButton({ showDatePicker = true }) {
+                            Icon(Icons.Default.CalendarMonth, null)
+                        }
+                    },
+                    enabled = false,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        disabledTextColor = Color.Black,
+                        disabledBorderColor = Color.LightGray,
+                        disabledLabelColor = Color.Gray,
+                        disabledTrailingIconColor = Color(0xFF278B68)
+                    )
+                )
+                if (error.isNotBlank()) Text(error, color = Color.Red, fontSize = 12.sp)
             }
         },
         confirmButton = {
             TextButton({
-                val n = amount.replace(',', '.').toDoubleOrNull(); if (source.isBlank()) error =
-                "Podaj źródło." else if (n == null || n <= 0) error =
-                "Podaj poprawną kwotę." else save(
-                Income(
-                    initial?.id ?: UUID.randomUUID().toString(), source.trim(), n, date.trim()
+                val n = amount.replace(',', '.').toDoubleOrNull()
+                if (source.isBlank()) error = "Podaj źródło."
+                else if (n == null || n <= 0) error = "Podaj poprawną kwotę."
+                else save(
+                    Income(
+                        initial?.id ?: UUID.randomUUID().toString(),
+                        source.trim(),
+                        n,
+                        date.trim()
+                    )
                 )
-            )
             }) { Text("ZAPISZ") }
         },
         dismissButton = { TextButton(dismiss) { Text("ANULUJ") } })
+
+    if (showDatePicker) {
+        val state = rememberDatePickerState()
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                TextButton({
+                    state.selectedDateMillis?.let {
+                        date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(it))
+                    }
+                    showDatePicker = false
+                }) { Text("OK") }
+            }
+        ) {
+            DatePicker(state)
+        }
+    }
 }
 
 
@@ -1576,11 +2050,12 @@ fun SettingsScreen(store: AppStore, back: () -> Unit) {
                             scope.launch {
                                 val release = GithubUpdater.check()
                                 updateChecking = false
-                                if (release == null) updateMessage =
-                                    "Brak nowszej wersji lub nie skonfigurowano GitHub."
-                                else {
-                                    updateMessage = "Dostępna wersja ${release.tag}."
-                                    GithubUpdater.downloadAndInstall(context, release)
+                                if (release == null) {
+                                    updateMessage =
+                                        "Brak nowszej wersji lub nie skonfigurowano GitHub."
+                                } else {
+                                    updateMessage =
+                                        "Dostępna wersja ${release.tag}. Wróć na ekran główny, aby rozpocząć aktualizację."
                                 }
                             }
                         }) {
@@ -1590,6 +2065,56 @@ fun SettingsScreen(store: AppStore, back: () -> Unit) {
                         }
                         if (updateMessage.isNotBlank()) Text(updateMessage, fontSize = 12.sp)
                     }
+                }
+            }
+
+            item {
+                var pinDialog by remember { mutableStateOf(false) }
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(Color.White)) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Bezpieczeństwo", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            "Zabezpiecz dostęp do aplikacji kodem PIN lub biometrią.",
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                        Spacer(Modifier.height(12.dp))
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Lock, null, tint = Color(0xFF278B68), modifier = Modifier.size(20.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Text("Kod PIN", Modifier.weight(1f))
+                            Switch(
+                                checked = store.securityPin != null,
+                                onCheckedChange = {
+                                    if (it) pinDialog = true
+                                    else {
+                                        store.setPin(null)
+                                        store.setBiometric(false)
+                                    }
+                                }
+                            )
+                        }
+
+                        if (store.securityPin != null) {
+                            Spacer(Modifier.height(8.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Fingerprint, null, tint = Color(0xFF278B68), modifier = Modifier.size(20.dp))
+                                Spacer(Modifier.width(12.dp))
+                                Text("Logowanie biometryczne", Modifier.weight(1f))
+                                Switch(
+                                    checked = store.biometricEnabled,
+                                    onCheckedChange = { store.setBiometric(it) }
+                                )
+                            }
+                        }
+                    }
+                }
+                if (pinDialog) {
+                    PinDialog(
+                        dismiss = { pinDialog = false },
+                        onSet = { store.setPin(it); pinDialog = false }
+                    )
                 }
             }
         }
@@ -1638,6 +2163,117 @@ fun CategoryDialog(initial: Category?, dismiss: () -> Unit, save: (Category) -> 
             }) { Text("ZAPISZ") }
         },
         dismissButton = { TextButton(dismiss) { Text("ANULUJ") } })
+}
+
+@Composable
+fun PinDialog(dismiss: () -> Unit, onSet: (String) -> Unit) {
+    var pin by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var step by remember { mutableIntStateOf(1) } // 1: wpisz, 2: potwierdź
+    var error by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = {
+            Text(
+                if (step == 1) "Ustaw kod PIN" else "Potwierdź kod PIN",
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    if (step == 1) "Wprowadź 4 cyfry" else "Wprowadź PIN ponownie",
+                    fontSize = 14.sp,
+                    color = Color.Gray
+                )
+                Spacer(Modifier.height(16.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    val current = if (step == 1) pin else confirm
+                    repeat(4) { index ->
+                        Box(
+                            Modifier
+                                .size(16.dp)
+                                .background(
+                                    if (index < current.length) Color(0xFF278B68) else Color(0xFFE0E0E0),
+                                    CircleShape
+                                )
+                        )
+                    }
+                }
+                if (error.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(error, color = Color.Red, fontSize = 12.sp)
+                }
+
+                Spacer(Modifier.height(24.dp))
+                val numbers = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "DEL")
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    numbers.chunked(3).forEach { row ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                            row.forEach { num ->
+                                if (num.isEmpty()) Spacer(Modifier.size(54.dp))
+                                else Box(
+                                    Modifier
+                                        .size(54.dp)
+                                        .background(Color(0xFFF5F7F6), CircleShape)
+                                        .clickable {
+                                            if (num == "DEL") {
+                                                if (step == 1 && pin.isNotEmpty()) pin = pin.dropLast(1)
+                                                if (step == 2 && confirm.isNotEmpty()) confirm =
+                                                    confirm.dropLast(1)
+                                            } else {
+                                                if (step == 1 && pin.length < 4) {
+                                                    pin += num
+                                                    if (pin.length == 4) {
+                                                        step = 2
+                                                        error = ""
+                                                    }
+                                                } else if (step == 2 && confirm.length < 4) {
+                                                    confirm += num
+                                                    if (confirm.length == 4) {
+                                                        if (confirm == pin) onSet(pin)
+                                                        else {
+                                                            confirm = ""
+                                                            error = "Kody PIN nie są zgodne."
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (num == "DEL") Icon(
+                                        Icons.Default.Backspace,
+                                        null,
+                                        Modifier.size(22.dp),
+                                        tint = Color(0xFF546E7A)
+                                    )
+                                    else Text(
+                                        num,
+                                        fontSize = 20.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF263238)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(dismiss) { Text("ANULUJ") } }
+    )
+}
+
+fun Context.findActivity(): FragmentActivity? = when (this) {
+    is FragmentActivity -> this
+    is android.content.ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 @Composable
@@ -1724,13 +2360,13 @@ fun Empty(text: String) {
 
 
 object GithubUpdater {
-    // Ustawienia aktualizacji z GitHub Releases
-    private const val GITHUB_OWNER = "janczesko12"
-    private const val GITHUB_REPO = "Wydatki"
-    private const val CURRENT_VERSION = "1.0.0"
+    // Pobieranie ustawień z build.gradle (BuildConfig)
+    private const val GITHUB_OWNER = BuildConfig.GITHUB_OWNER
+    private const val GITHUB_REPO = BuildConfig.GITHUB_REPO
+    private val CURRENT_VERSION: String
+        get() = BuildConfig.VERSION_NAME
 
     suspend fun check(): ReleaseInfo? = withContext(Dispatchers.IO) {
-        if (GITHUB_OWNER == "YOUR_GITHUB_USERNAME") return@withContext null
         try {
             val c =
                 URL("https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest").openConnection() as HttpURLConnection
@@ -1764,27 +2400,87 @@ object GithubUpdater {
         return false
     }
 
-    suspend fun downloadAndInstall(context: Context, release: ReleaseInfo) =
-        withContext(Dispatchers.IO) {
-            try {
-                val dir = File(context.cacheDir, "updates").apply { mkdirs() }
-                val file = File(dir, "Wydatki-${release.tag}.apk")
-                URL(release.apkUrl).openStream()
-                    .use { input -> file.outputStream().use { output -> input.copyTo(output) } }
-                val uri = androidx.core.content.FileProvider.getUriForFile(
-                    context,
-                    "${context.packageName}.fileprovider",
-                    file
-                )
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, "application/vnd.android.package-archive")
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    suspend fun downloadAndInstall(
+        context: Context,
+        release: ReleaseInfo,
+        onProgress: (Int) -> Unit = {}
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val dir = File(context.cacheDir, "updates").apply { mkdirs() }
+            val file = File(dir, "Wydatki-${release.tag}.apk")
+
+            val connection =
+                URL(release.apkUrl).openConnection() as HttpURLConnection
+            connection.connectTimeout = 10000
+            connection.readTimeout = 15000
+            connection.connect()
+
+            val total = connection.contentLengthLong
+            var downloaded = 0L
+
+            connection.inputStream.use { input ->
+                file.outputStream().use { output ->
+                    val buffer = ByteArray(16 * 1024)
+
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count == -1) break
+
+                        output.write(buffer, 0, count)
+                        downloaded += count
+
+                        if (total > 0) {
+                            val progress =
+                                ((downloaded * 100L) / total)
+                                    .toInt()
+                                    .coerceIn(0, 100)
+
+                            withContext(Dispatchers.Main) {
+                                onProgress(progress)
+                            }
+                        }
+                    }
                 }
-                withContext(Dispatchers.Main) {
-                    context.startActivity(intent)
-                }
-            } catch (_: Exception) {
             }
+
+            withContext(Dispatchers.Main) {
+                onProgress(100)
+            }
+
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file
+            )
+
+            // Android 8+ wymaga zgody na instalowanie APK spoza sklepu.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                !context.packageManager.canRequestPackageInstalls()
+            ) {
+                withContext(Dispatchers.Main) {
+                    context.startActivity(
+                        Intent(
+                            AndroidSettings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:${context.packageName}")
+                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+                return@withContext true
+            }
+
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+
+            withContext(Dispatchers.Main) {
+                context.startActivity(intent)
+            }
+
+            true
+        } catch (_: Exception) {
+            false
         }
+    }
 }
