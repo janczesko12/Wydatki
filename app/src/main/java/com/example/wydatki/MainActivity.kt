@@ -1,11 +1,16 @@
 package com.example.wydatki
 
 import android.annotation.SuppressLint
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import androidx.core.app.NotificationCompat
 import android.provider.Settings as AndroidSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -745,8 +750,43 @@ fun WydatkiApp(store: AppStore) {
     var updateProgress by remember { mutableStateOf(0) }
     var updateError by remember { mutableStateOf("") }
 
+    var updateAvailableRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
+    var showNewUpdateDialog by remember { mutableStateOf(false) }
+
     LaunchedEffect(Unit) {
-        availableRelease = GithubUpdater.check()
+        withContext(Dispatchers.IO) {
+            try {
+                val release = GithubUpdater.check()
+                if (release != null) {
+                    withContext(Dispatchers.Main) {
+                        updateAvailableRelease = release
+                        showNewUpdateDialog = true
+                        showUpdateNotification(context, release.tag)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    if (showNewUpdateDialog && updateAvailableRelease != null) {
+        val release = updateAvailableRelease!!
+        AlertDialog(
+            onDismissRequest = { showNewUpdateDialog = false },
+            title = { Text("🎉 Dostępna nowa aktualizacja!") },
+            text = { Text("Wydatki ${release.tag} jest już dostępna.") },
+            confirmButton = {
+                TextButton({
+                    showNewUpdateDialog = false
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/janczesko12/Wydatki/releases/latest"))
+                        context.startActivity(intent)
+                    } catch (_: Exception) {}
+                }) { Text("Pobierz aktualizację") }
+            },
+            dismissButton = {
+                TextButton({ showNewUpdateDialog = false }) { Text("Później") }
+            }
+        )
     }
 
     val selectedTab = when (screen) {
@@ -2380,6 +2420,56 @@ fun Empty(text: String) {
         Modifier.fillMaxWidth().padding(30.dp),
         contentAlignment = Alignment.Center
     ) { Text(text, color = Color.Gray) }
+}
+
+
+fun showUpdateNotification(context: Context, tagName: String) {
+    try {
+        val prefs = context.getSharedPreferences("wydatki_update_prefs", Context.MODE_PRIVATE)
+        val lastNotified = prefs.getString("last_notified_version", "")
+        if (lastNotified == tagName) return
+        prefs.edit().putString("last_notified_version", tagName).apply()
+
+        val channelId = "app_updates_channel"
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Aktualizacje aplikacji",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Powiadomienia o dostępnych nowych wersjach aplikacji"
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                return
+            }
+        }
+
+        val updateUrl = "https://github.com/janczesko12/Wydatki/releases/latest"
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(updateUrl))
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("Wydatki – dostępna aktualizacja")
+            .setContentText("Wydatki $tagName jest już dostępna.")
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        notificationManager.notify(1001, notification)
+    } catch (_: Exception) {}
 }
 
 
