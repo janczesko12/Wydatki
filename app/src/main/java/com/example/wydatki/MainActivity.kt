@@ -421,7 +421,7 @@ class AppStore(context: Context) {
             val ca = o.getJSONArray("categories")
             val ea = o.getJSONArray("expenses")
             val ia = o.getJSONArray("incomes")
-            val c = List(ca.length()) { n ->
+            val cCloud = List(ca.length()) { n ->
                 ca.getJSONObject(n).let {
                     Category(
                         it.getString("id"),
@@ -431,7 +431,7 @@ class AppStore(context: Context) {
                     )
                 }
             }
-            val e = List(ea.length()) { n ->
+            val eCloud = List(ea.length()) { n ->
                 ea.getJSONObject(n).let {
                     Expense(
                         it.optString("id", UUID.randomUUID().toString()),
@@ -444,7 +444,7 @@ class AppStore(context: Context) {
                     )
                 }
             }
-            val i = List(ia.length()) { n ->
+            val iCloud = List(ia.length()) { n ->
                 ia.getJSONObject(n).let {
                     Income(
                         it.getString("id"),
@@ -455,7 +455,11 @@ class AppStore(context: Context) {
                     )
                 }
             }
-            replaceAll(c, e, i, false)
+            val mergedCategories = (categories + cCloud).distinctBy { it.id }
+            val mergedExpenses = (expenses + eCloud).distinctBy { it.id }
+            val mergedIncomes = (incomes + iCloud).distinctBy { it.id }
+
+            replaceAll(mergedCategories, mergedExpenses, mergedIncomes, true)
             updateCloudStatus("Chmura: zsynchronizowano")
         } catch (_: Exception) {
             updateCloudStatus("Chmura: nieprawidłowe dane")
@@ -570,7 +574,10 @@ object FirebaseCloud {
     fun logout() {
         auth?.signOut()
         ready = false
-        store?.get()?.updateCloudStatus("Chmura: wylogowano")
+        store?.get()?.let {
+            it.replaceAll(emptyList(), emptyList(), emptyList(), false)
+            it.updateCloudStatus("Chmura: wylogowano")
+        }
     }
 
     fun isConfigured() = auth != null && db != null
@@ -1932,7 +1939,7 @@ fun SettingsScreen(store: AppStore, back: () -> Unit) {
     var updateMessage by remember { mutableStateOf("") }
 
     val create =
-        rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
             if (uri != null) {
                 try {
                     context.contentResolver.openOutputStream(uri)
@@ -2050,14 +2057,7 @@ fun SettingsScreen(store: AppStore, back: () -> Unit) {
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button({ create.launch("Wydatki-backup.json") }) { Text("EKSPORTUJ") }
-                            Button({
-                                open.launch(
-                                    arrayOf(
-                                        "application/json",
-                                        "text/*"
-                                    )
-                                )
-                            }) { Text("IMPORTUJ") }
+                            Button({ open.launch(arrayOf("*/*")) }) { Text("IMPORTUJ") }
                         }
                         if (message.isNotBlank()) {
                             Spacer(Modifier.height(6.dp))
