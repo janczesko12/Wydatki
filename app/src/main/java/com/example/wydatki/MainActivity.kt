@@ -111,7 +111,7 @@ import java.util.UUID
 import kotlin.math.max
 
 data class Category(val id: String, val name: String, val emoji: String, val sort: Int = 0)
-data class Expense(val id: String, val categoryId: String, val amount: Double, val description: String, val date: String, val note: String = "")
+data class Expense(val id: String, val categoryId: String, val amount: Double, val description: String, val date: String, val note: String = "", val createdAt: String = "")
 data class Income(val id: String, val source: String, val amount: Double, val date: String, val note: String = "")
 data class ReleaseInfo(val tag: String, val apkUrl: String)
 
@@ -228,11 +228,13 @@ class AppStore(context: Context) {
             put("expenses", JSONArray().apply {
                 expenses.forEach {
                     put(JSONObject().apply {
-                        put("id", it.id); put("categoryId", it.categoryId); put("amount", it.amount)
-                        put("description", it.description); put("date", it.date); put(
-                        "note",
-                        it.note
-                    )
+                        put("id", it.id)
+                        put("categoryId", it.categoryId)
+                        put("amount", it.amount)
+                        put("description", it.description)
+                        put("date", it.date)
+                        put("note", it.note)
+                        put("createdAt", it.createdAt)
                     })
                 }
             })
@@ -268,12 +270,13 @@ class AppStore(context: Context) {
             val e = List(ea.length()) { n ->
                 ea.getJSONObject(n).let {
                     Expense(
-                        it.getString("id"),
-                        it.getString("categoryId"),
-                        it.getDouble("amount"),
-                        it.getString("description"),
-                        it.getString("date"),
-                        it.optString("note")
+                        it.optString("id", UUID.randomUUID().toString()),
+                        it.optString("categoryId", ""),
+                        it.optDouble("amount", 0.0),
+                        it.optString("description", ""),
+                        it.optString("date", today()),
+                        it.optString("note", ""),
+                        it.optString("createdAt", "")
                     )
                 }
             }
@@ -314,10 +317,13 @@ class AppStore(context: Context) {
     private fun expensesJson() = JSONArray().apply {
         expenses.forEach {
             put(JSONObject().apply {
-                put("id", it.id); put("categoryId", it.categoryId); put(
-                "amount",
-                it.amount
-            ); put("description", it.description); put("date", it.date); put("note", it.note)
+                put("id", it.id)
+                put("categoryId", it.categoryId)
+                put("amount", it.amount)
+                put("description", it.description)
+                put("date", it.date)
+                put("note", it.note)
+                put("createdAt", it.createdAt)
             })
         }
     }.toString()
@@ -357,12 +363,13 @@ class AppStore(context: Context) {
             val a = JSONArray(raw); List(a.length()) { n ->
                 a.getJSONObject(n).let {
                     Expense(
-                        it.getString("id"),
-                        it.getString("categoryId"),
-                        it.getDouble("amount"),
-                        it.getString("description"),
-                        it.getString("date"),
-                        it.optString("note")
+                        it.optString("id", UUID.randomUUID().toString()),
+                        it.optString("categoryId", ""),
+                        it.optDouble("amount", 0.0),
+                        it.optString("description", ""),
+                        it.optString("date", today()),
+                        it.optString("note", ""),
+                        it.optString("createdAt", "")
                     )
                 }
             }
@@ -422,12 +429,13 @@ class AppStore(context: Context) {
             val e = List(ea.length()) { n ->
                 ea.getJSONObject(n).let {
                     Expense(
-                        it.getString("id"),
-                        it.getString("categoryId"),
-                        it.getDouble("amount"),
-                        it.getString("description"),
-                        it.getString("date"),
-                        it.optString("note")
+                        it.optString("id", UUID.randomUUID().toString()),
+                        it.optString("categoryId", ""),
+                        it.optDouble("amount", 0.0),
+                        it.optString("description", ""),
+                        it.optString("date", today()),
+                        it.optString("note", ""),
+                        it.optString("createdAt", "")
                     )
                 }
             }
@@ -904,7 +912,19 @@ fun shiftMonth(month: String, d: Int): String {
 }
 
 fun today() = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+fun currentDateTime() = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
 fun money(v: Double) = String.format(Locale.forLanguageTag("pl-PL"), "%.2f zł", v)
+
+fun formatExpenseDate(e: Expense): String {
+    val dateStr = e.date.ifBlank { e.createdAt.take(10) }
+    val timeStr = e.createdAt.split(" ").getOrNull(1) ?: ""
+    return when {
+        dateStr.isNotBlank() && timeStr.isNotBlank() -> "$dateStr $timeStr"
+        dateStr.isNotBlank() -> dateStr
+        e.createdAt.isNotBlank() -> e.createdAt
+        else -> "Brak daty"
+    }
+}
 
 @Composable
 fun DashboardScreen(
@@ -1014,7 +1034,7 @@ fun SummarySection(income: Double, expenses: Double, remaining: Double) {
     }
     Spacer(Modifier.height(8.dp)); SummaryCard(
         Modifier.fillMaxWidth(),
-        "POZOSTAŁO",
+        "POZOSTAŁO PIENIĘDZY",
         remaining,
         Color(0xFFE5F1F8),
         Color(0xFF156082)
@@ -1074,7 +1094,7 @@ fun CategoryScreen(store: AppStore, c: Category, month: String, back: () -> Unit
     var dialog by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Expense?>(null) }
     val list = store.expenses.filter { it.categoryId == c.id && monthOf(it.date) == month }
-        .sortedByDescending { it.date }
+        .sortedByDescending { it.createdAt.ifBlank { it.date } }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -1136,7 +1156,7 @@ fun ExpenseCard(e: Expense, edit: () -> Unit, delete: () -> Unit) {
                     e.description.ifBlank { "Wydatek" },
                     fontWeight = FontWeight.SemiBold
                 ); Text(
-                e.date,
+                formatExpenseDate(e),
                 fontSize = 12.sp,
                 color = Color.Gray
             ); if (e.note.isNotBlank()) Text(e.note, fontSize = 12.sp, color = Color.Gray)
@@ -1169,7 +1189,7 @@ fun ExpenseDialog(
     }
     var desc by remember { mutableStateOf(initial?.description ?: "") }
     var date by remember {
-        mutableStateOf(initial?.date ?: "$month-01")
+        mutableStateOf(initial?.date ?: if (today().startsWith(month)) today() else "$month-01")
     }
     var note by remember { mutableStateOf(initial?.note ?: "") }
     var error by remember { mutableStateOf("") }
@@ -1228,16 +1248,20 @@ fun ExpenseDialog(
                 val n =
                     amount.replace(',', '.').toDoubleOrNull(); if (n == null || n <= 0) error =
                 "Podaj poprawną kwotę." else if (desc.isBlank()) error =
-                "Podaj opis." else save(
-                Expense(
-                    initial?.id ?: UUID.randomUUID().toString(),
-                    c.id,
-                    n,
-                    desc.trim(),
-                    date.trim(),
-                    note.trim()
+                "Podaj opis." else {
+                val now = currentDateTime()
+                save(
+                    Expense(
+                        initial?.id ?: UUID.randomUUID().toString(),
+                        c.id,
+                        n,
+                        desc.trim(),
+                        date.trim(),
+                        note.trim(),
+                        if (initial == null) now else initial.createdAt.ifBlank { now }
+                    )
                 )
-            )
+            }
             }) { Text("ZAPISZ") }
         },
         dismissButton = { TextButton(dismiss) { Text("ANULUJ") } })
@@ -1271,7 +1295,7 @@ fun ExpensesScreen(store: AppStore, month: String, back: () -> Unit) {
             query,
             true
         ) || it.note.contains(query, true))
-    }.sortedByDescending { it.date }
+    }.sortedByDescending { it.createdAt.ifBlank { it.date } }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -1331,7 +1355,7 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
     val expenses = if (viewMode == "year") {
         store.expenses.filter { monthOf(it.date).startsWith("$selectedYear-") }
     } else {
-        store.expenses.filter { it.date in startDate..endDate }
+        store.expenses.filter { it.date.take(10) in startDate..endDate }
     }
     
     val income = if (viewMode == "year") {
@@ -1351,7 +1375,7 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
     val monthIncome = store.incomes.filter { monthOf(it.date) == month }.sumOf { it.amount }
     
     val avg = if (expenses.isEmpty()) 0.0
-    else total / expenses.map { it.date }.distinct().size
+    else total / expenses.map { it.date.take(10) }.filter { it.isNotBlank() }.distinct().size
 
     Column(Modifier.fillMaxSize().background(Color(0xFFF6F8F7))) {
         Row(
@@ -1534,7 +1558,7 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                     SummaryCard(
                         Modifier.fillMaxWidth(),
                         "ŚREDNIO / DZIEŃ",
-                        if (monthExpenses.isEmpty()) 0.0 else monthTotal / monthExpenses.map { it.date }.distinct().size,
+                        if (monthExpenses.isEmpty()) 0.0 else monthTotal / monthExpenses.map { it.date.take(10) }.filter { it.isNotBlank() }.distinct().size,
                         Color(0xFFE5F1F8),
                         Color(0xFF156082)
                     )
@@ -1642,7 +1666,7 @@ fun SearchScreen(store: AppStore, back: () -> Unit) {
             q,
             true
         ) == true)
-    }.sortedByDescending { it.date }
+    }.sortedByDescending { it.createdAt.ifBlank { it.date } }
     Column(Modifier.fillMaxSize().background(Color(0xFFF6F8F7))) {
         Row(
             Modifier.fillMaxWidth().padding(12.dp),
