@@ -21,16 +21,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricPrompt
 import androidx.fragment.app.FragmentActivity
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -94,7 +84,6 @@ import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.animation.animateContentSize
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -286,12 +275,12 @@ class AppStore(context: Context, startCloud: Boolean = true) {
 
     fun setPin(pin: String?) {
         securityPin = pin
-        prefs?.edit()?.putString("security_pin", pin)?.apply()
+        prefs?.edit()?.putString("security_pin", pin)?.commit()
     }
 
     fun setBiometric(enabled: Boolean) {
         biometricEnabled = enabled
-        prefs?.edit()?.putBoolean("biometric_enabled", enabled)?.apply()
+        prefs?.edit()?.putBoolean("biometric_enabled", enabled)?.commit()
     }
 
     fun exportJson(): String {
@@ -895,10 +884,12 @@ private fun saveJsonToDownloads(
             resolver.update(uri, values, null, null)
             true
         } else {
-            val dir = File(
-                context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS),
-                AUTO_JSON_BACKUP_FOLDER
-            )
+            val baseDir = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.FROYO) {
+                context.getExternalFilesDir("Documents") ?: context.filesDir
+            } else {
+                context.filesDir
+            }
+            val dir = File(baseDir, AUTO_JSON_BACKUP_FOLDER)
             if (!dir.exists()) dir.mkdirs()
 
             File(dir, fileName).writeText(json, Charsets.UTF_8)
@@ -916,7 +907,7 @@ private fun saveAutomaticJsonBackup(context: Context, json: String): Boolean {
         context.getSharedPreferences("wydatki_data", Context.MODE_PRIVATE)
             .edit()
             .putString("last_local_json_backup_at", currentDateTime())
-            .apply()
+            .commit()
     }
 
     return ok
@@ -937,7 +928,7 @@ private fun savePreUpdateJsonBackup(
             .edit()
             .putString("last_pre_update_backup_at", currentDateTime())
             .putString("last_pre_update_backup_file", fileName)
-            .apply()
+            .commit()
     }
 
     return ok
@@ -951,8 +942,8 @@ object BackupScheduler {
         // Brak wymogu sieci: lokalna kopia JSON ma powstawać także offline.
         // Sam zapis do Firebase zostanie ponowiony przez WorkManager po błędzie sieci.
         val request = PeriodicWorkRequestBuilder<FirestoreBackupWorker>(
-            30,
-            java.util.concurrent.TimeUnit.MINUTES
+            30L * 60L,
+            java.util.concurrent.TimeUnit.SECONDS
         )
             .build()
 
@@ -1220,8 +1211,7 @@ fun WydatkiApp(store: AppStore) {
     // Zachowuje dokładną pozycję przewinięcia pulpitu po wejściu do kategorii i powrocie.
     val dashboardListState = rememberLazyListState()
 
-    // Pozycje list są trzymane poza ekranami, więc przełączanie AnimatedContent
-    // i animacje kart nie zerują miejsca przewinięcia.
+    // Pozycje list są trzymane poza ekranami, dzięki czemu scroll jest zachowany.
     val categoryListStates = remember { mutableMapOf<String, LazyListState>() }
     val expensesListState = remember { LazyListState() }
 
@@ -1233,8 +1223,8 @@ fun WydatkiApp(store: AppStore) {
     var updateProgress by remember { mutableStateOf(0) }
     var updateError by remember { mutableStateOf("") }
 
-    var updateAvailableRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
-    var showNewUpdateDialog by remember { mutableStateOf(false) }
+    // Dostępna aktualizacja jest obsługiwana bezpośrednio w aplikacji.
+    // Nie otwieramy strony GitHub w przeglądarce.
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
@@ -1255,34 +1245,12 @@ fun WydatkiApp(store: AppStore) {
                     }
 
                     withContext(Dispatchers.Main) {
-                        updateAvailableRelease = release
-                        showNewUpdateDialog = true
+                        availableRelease = release
                         showUpdateNotification(context, release.tag)
                     }
                 }
             } catch (_: Exception) {}
         }
-    }
-
-    if (showNewUpdateDialog && updateAvailableRelease != null) {
-        val release = updateAvailableRelease!!
-        AlertDialog(
-            onDismissRequest = { showNewUpdateDialog = false },
-            title = { Text("🎉 Dostępna nowa aktualizacja!") },
-            text = { Text("Wydatki ${release.tag} jest już dostępna.") },
-            confirmButton = {
-                TextButton({
-                    showNewUpdateDialog = false
-                    try {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/janczesko12/Wydatki/releases/latest"))
-                        context.startActivity(intent)
-                    } catch (_: Exception) {}
-                }) { Text("Pobierz aktualizację") }
-            },
-            dismissButton = {
-                TextButton({ showNewUpdateDialog = false }) { Text("Później") }
-            }
-        )
     }
 
     val selectedTab = when (screen) {
@@ -1294,72 +1262,39 @@ fun WydatkiApp(store: AppStore) {
 
     Column(Modifier.fillMaxSize().background(Color(0xFFF6F8F7))) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            AnimatedContent(
-                targetState = screen,
-                transitionSpec = {
-                    (
-                            slideInHorizontally(
-                                animationSpec = androidx.compose.animation.core.tween(340),
-                                initialOffsetX = { it / 4 }
-                            ) +
-                                    fadeIn(
-                                        animationSpec = androidx.compose.animation.core.tween(340)
-                                    ) +
-                                    scaleIn(
-                                        initialScale = 0.97f,
-                                        animationSpec = androidx.compose.animation.core.tween(340)
-                                    )
-                            ) togetherWith
-                            (
-                                    slideOutHorizontally(
-                                        animationSpec = androidx.compose.animation.core.tween(220),
-                                        targetOffsetX = { -it / 6 }
-                                    ) +
-                                            fadeOut(
-                                                animationSpec = androidx.compose.animation.core.tween(180)
-                                            ) +
-                                            scaleOut(
-                                                targetScale = 0.985f,
-                                                animationSpec = androidx.compose.animation.core.tween(220)
-                                            )
-                                    )
-                },
-                label = "screen_transition"
-            ) { currentScreen ->
-                when (currentScreen) {
-                    "dashboard" -> DashboardScreen(
-                        store,
-                        month,
-                        { month = it },
-                        { selected = it; screen = "category" },
-                        { screen = it },
-                        dashboardListState
-                    )
+            when (screen) {
+                "dashboard" -> DashboardScreen(
+                    store,
+                    month,
+                    { month = it },
+                    { selected = it; screen = "category" },
+                    { screen = it },
+                    dashboardListState
+                )
 
-                    "category" -> selected?.let {
-                        val stateKey = "${it.id}|$month"
-                        val categoryListState = categoryListStates.getOrPut(stateKey) {
-                            LazyListState()
-                        }
-
-                        CategoryScreen(
-                            store,
-                            it,
-                            month,
-                            categoryListState
-                        ) { screen = "dashboard" }
+                "category" -> selected?.let {
+                    val stateKey = "${it.id}|$month"
+                    val categoryListState = categoryListStates.getOrPut(stateKey) {
+                        LazyListState()
                     }
 
-                    "expenses" -> ExpensesScreen(
+                    CategoryScreen(
                         store,
+                        it,
                         month,
-                        expensesListState
+                        categoryListState
                     ) { screen = "dashboard" }
-                    "income" -> IncomeScreen(store, month) { screen = "dashboard" }
-                    "stats" -> StatisticsScreen(store, month, { month = it }) { screen = "dashboard" }
-                    "search" -> SearchScreen(store) { screen = "dashboard" }
-                    "settings" -> SettingsScreen(store) { screen = "dashboard" }
                 }
+
+                "expenses" -> ExpensesScreen(
+                    store,
+                    month,
+                    expensesListState
+                ) { screen = "dashboard" }
+                "income" -> IncomeScreen(store, month) { screen = "dashboard" }
+                "stats" -> StatisticsScreen(store, month, { month = it }) { screen = "dashboard" }
+                "search" -> SearchScreen(store) { screen = "dashboard" }
+                "settings" -> SettingsScreen(store) { screen = "dashboard" }
             }
         }
 
@@ -1650,12 +1585,8 @@ fun SummaryCard(
     fg: Color,
     onClick: (() -> Unit)? = null
 ) {
-    val animatedModifier = modifier.animateContentSize(
-        animationSpec = androidx.compose.animation.core.tween(220)
-    )
-
     Card(
-        if (onClick != null) animatedModifier.clickable(onClick = onClick) else animatedModifier,
+        if (onClick != null) modifier.clickable(onClick = onClick) else modifier,
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(bg)
     ) {
@@ -1674,32 +1605,9 @@ fun SummaryCard(
 
 @Composable
 fun PortfolioReveal(index: Int = 0, content: @Composable () -> Unit) {
-    var visible by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        kotlinx.coroutines.delay((index.coerceAtMost(6) * 45L))
-        visible = true
-    }
-
-    // Animacja działa przez alpha + offset, które NIE zmieniają wysokości
-    // elementu w LazyColumn. Dzięki temu scroll nie skacze.
-    val alpha by androidx.compose.animation.core.animateFloatAsState(
-        targetValue = if (visible) 1f else 0f,
-        animationSpec = androidx.compose.animation.core.tween(420),
-        label = "portfolio_reveal_alpha"
-    )
-
-    val offsetY by animateDpAsState(
-        targetValue = if (visible) 0.dp else 18.dp,
-        animationSpec = androidx.compose.animation.core.tween(420),
-        label = "portfolio_reveal_offset"
-    )
-
+    // Bez animacji — element pojawia się natychmiast.
     Box(
-        Modifier
-            .fillMaxWidth()
-            .offset(y = offsetY)
-            .alpha(alpha)
+        Modifier.fillMaxWidth()
     ) {
         content()
     }
@@ -1710,9 +1618,6 @@ fun CategoryCard(c: Category, amount: Double, onClick: () -> Unit) {
     Card(
         Modifier
             .fillMaxWidth()
-            .animateContentSize(
-                animationSpec = androidx.compose.animation.core.tween(220)
-            )
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(14.dp),
         colors = CardDefaults.cardColors(Color.White)
@@ -3004,16 +2909,8 @@ fun BottomBar(tab: (String) -> Unit, selected: String) {
 
 @Composable
 fun BottomItem(e: String, t: String, s: Boolean, on: () -> Unit) {
-    val iconSize by animateDpAsState(
-        targetValue = if (s) 24.dp else 20.dp,
-        animationSpec = androidx.compose.animation.core.tween(180),
-        label = "bottom_icon_size"
-    )
-    val textColor by animateColorAsState(
-        targetValue = if (s) Color(0xFF278B68) else Color.Gray,
-        animationSpec = androidx.compose.animation.core.tween(180),
-        label = "bottom_text_color"
-    )
+    val iconSize = if (s) 24.dp else 20.dp
+    val textColor = if (s) Color(0xFF278B68) else Color.Gray
     Column(
         Modifier.clickable(onClick = on).padding(horizontal = 10.dp),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -3077,7 +2974,7 @@ fun showUpdateNotification(context: Context, tagName: String) {
         val prefs = context.getSharedPreferences("wydatki_update_prefs", Context.MODE_PRIVATE)
         val lastNotified = prefs.getString("last_notified_version", "")
         if (lastNotified == tagName) return
-        prefs.edit().putString("last_notified_version", tagName).apply()
+        prefs.edit().putString("last_notified_version", tagName).commit()
 
         val channelId = "app_updates_channel"
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -3099,8 +2996,11 @@ fun showUpdateNotification(context: Context, tagName: String) {
             }
         }
 
-        val updateUrl = "https://github.com/janczesko12/Wydatki/releases/latest"
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(updateUrl))
+        // Kliknięcie powiadomienia wraca do aplikacji.
+        // Aktualizacja jest pobierana i instalowana z poziomu aplikacji.
+        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            ?.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            ?: Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
         val pendingIntent = PendingIntent.getActivity(
             context,
             0,
@@ -3127,6 +3027,7 @@ private const val PREF_PENDING_UPDATE_TAG = "pending_update_tag"
 private const val PREF_PENDING_UPDATE_BEFORE_TIME = "pending_update_before_time"
 
 private fun installedUpdateTime(context: Context): Long {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.GINGERBREAD) return 0L
     return try {
         context.packageManager
             .getPackageInfo(context.packageName, 0)
@@ -3141,7 +3042,7 @@ private fun rememberUpdateInstallStarted(context: Context, tag: String) {
         .edit()
         .putString(PREF_PENDING_UPDATE_TAG, tag)
         .putLong(PREF_PENDING_UPDATE_BEFORE_TIME, installedUpdateTime(context))
-        .apply()
+        .commit()
 }
 
 private fun updateWasInstalled(context: Context, tag: String): Boolean {
@@ -3156,7 +3057,7 @@ private fun updateWasInstalled(context: Context, tag: String): Boolean {
         prefs.edit()
             .remove(PREF_PENDING_UPDATE_TAG)
             .remove(PREF_PENDING_UPDATE_BEFORE_TIME)
-            .apply()
+            .commit()
         return true
     }
 
@@ -3225,7 +3126,7 @@ object GithubUpdater {
             connection.readTimeout = 15000
             connection.connect()
 
-            val total = connection.contentLengthLong
+            val total = connection.contentLength.toLong()
             var downloaded = 0L
 
             connection.inputStream.use { input ->
