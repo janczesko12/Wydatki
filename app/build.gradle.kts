@@ -57,5 +57,8 @@ dependencies {
 
     implementation("androidx.biometric:biometric:1.2.0-alpha05")
 
+    // WorkManager is used for periodic local and Firebase backups.
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
+
     testImplementation("junit:junit:4.13.2")
 }
