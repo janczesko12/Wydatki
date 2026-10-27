@@ -61,6 +61,8 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
@@ -1370,15 +1372,22 @@ fun ExpensesScreen(store: AppStore, month: String, back: () -> Unit) {
 fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit, back: () -> Unit) {
     var viewMode by remember { mutableStateOf("year") } // "year" or "period"
     var selectedYear by remember { mutableIntStateOf(month.substring(0, 4).toInt()) }
-    
+    var selectedCategoryId by remember { mutableStateOf("all") }
+    var categoryMenuExpanded by remember { mutableStateOf(false) }
+
     var startDate by remember { mutableStateOf(today()) }
     var endDate by remember { mutableStateOf(today()) }
     var datePickerTarget by remember { mutableStateOf<String?>(null) }
 
-    val expenses = if (viewMode == "year") {
+    val dateFilteredExpenses = if (viewMode == "year") {
         store.expenses.filter { monthOf(it.date).startsWith("$selectedYear-") }
     } else {
-        store.expenses.filter { it.date.take(10) in startDate..endDate }
+        val from = minOf(startDate, endDate)
+        val to = maxOf(startDate, endDate)
+        store.expenses.filter { it.date.take(10) in from..to }
+    }
+    val expenses = dateFilteredExpenses.filter {
+        selectedCategoryId == "all" || it.categoryId == selectedCategoryId
     }
     
     val income = if (viewMode == "year") {
@@ -1393,7 +1402,10 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
         category to expenses.filter { it.categoryId == category.id }.sumOf { it.amount }
     }.filter { it.second > 0 }.sortedByDescending { it.second }
 
-    val monthExpenses = store.expenses.filter { monthOf(it.date) == month }
+    val monthExpenses = store.expenses.filter {
+        monthOf(it.date) == month &&
+            (selectedCategoryId == "all" || it.categoryId == selectedCategoryId)
+    }
     val monthTotal = monthExpenses.sumOf { it.amount }
     val monthIncome = store.incomes.filter { monthOf(it.date) == month }.sumOf { it.amount }
     
@@ -1505,7 +1517,47 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                             }
                         }
 
-                        Spacer(Modifier.height(12.dp))
+                        Spacer(Modifier.height(16.dp))
+                        Text("KATEGORIA", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF64748B))
+                        Spacer(Modifier.height(6.dp))
+                        Box {
+                            val selectedCategory = store.categories.firstOrNull { it.id == selectedCategoryId }
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().clickable { categoryMenuExpanded = true },
+                                shape = RoundedCornerShape(12.dp),
+                                color = Color(0xFFF1F7F4),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFD5E8DD))
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 11.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        if (selectedCategoryId == "all") "📊  Wszystkie kategorie" else (selectedCategory?.emoji ?: "💰") + "  " + (selectedCategory?.name ?: "Kategoria"),
+                                        modifier = Modifier.weight(1f),
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color(0xFF1F513E)
+                                    )
+                                    Icon(Icons.AutoMirrored.Filled.ArrowForwardIos, null, Modifier.size(16.dp), tint = Color(0xFF278B68))
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = categoryMenuExpanded,
+                                onDismissRequest = { categoryMenuExpanded = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("📊  Wszystkie kategorie") },
+                                    onClick = { selectedCategoryId = "all"; categoryMenuExpanded = false }
+                                )
+                                store.categories.forEach { category ->
+                                    DropdownMenuItem(
+                                        text = { Text(category.emoji + "  " + category.name) },
+                                        onClick = { selectedCategoryId = category.id; categoryMenuExpanded = false }
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(14.dp))
                         Text(if (viewMode == "year") "SUMA ROKU" else "SUMA OKRESU", fontSize = 12.sp, color = Color.Gray)
                         Text(
                             money(total),
@@ -1529,7 +1581,10 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
 
                 items((1..12).toList()) { monthNumber ->
                     val ym = String.format(Locale.US, "%04d-%02d", selectedYear, monthNumber)
-                    val mExpenses = store.expenses.filter { monthOf(it.date) == ym }.sumOf { it.amount }
+                    val mExpenses = store.expenses.filter {
+                        monthOf(it.date) == ym &&
+                            (selectedCategoryId == "all" || it.categoryId == selectedCategoryId)
+                    }.sumOf { it.amount }
                     val mIncome = store.incomes.filter { monthOf(it.date) == ym }.sumOf { it.amount }
                     val active = ym == month
 
