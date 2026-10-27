@@ -1,6 +1,7 @@
 name: Android Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*' # Uruchamia się po wypchnięciu taga np. v1.0.4
