@@ -129,6 +129,14 @@ class MainActivity : FragmentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        // Po powrocie z instalatora Androida sprawdź, czy nowa wersja rzeczywiście jest już aktywna.
+        if (::store.isInitialized) {
+            UpdateRefreshBus.requestRefresh()
+        }
+    }
 }
 
 class AppStore(context: Context) {
@@ -744,9 +752,21 @@ fun WydatkiApp(store: AppStore) {
     var updateDownloading by remember { mutableStateOf(false) }
     var updateProgress by remember { mutableStateOf(0) }
     var updateError by remember { mutableStateOf("") }
+    var updateRefreshToken by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(Unit) {
         availableRelease = GithubUpdater.check()
+    }
+
+    LaunchedEffect(updateRefreshToken) {
+        if (updateRefreshToken > 0) {
+            availableRelease = GithubUpdater.check()
+        }
+    }
+
+    DisposableEffect(Unit) {
+        UpdateRefreshBus.onRefresh = { updateRefreshToken++ }
+        onDispose { UpdateRefreshBus.onRefresh = null }
     }
 
     val selectedTab = when (screen) {
@@ -829,7 +849,10 @@ fun WydatkiApp(store: AppStore) {
                             updateDownloading = false
 
                             if (success) {
+                                // Ukryj komunikat na czas instalacji. Po powrocie z instalatora
+                                // onResume ponownie sprawdzi wersję zainstalowaną na urządzeniu.
                                 availableRelease = null
+                                UpdateRefreshBus.refreshRequested = true
                             } else {
                                 updateError = "Nie udało się pobrać aktualizacji."
                             }
@@ -2383,6 +2406,29 @@ fun Empty(text: String) {
 }
 
 
+object UpdateRefreshBus {
+    @Volatile
+    var refreshRequested: Boolean = false
+
+    @Volatile
+    var onRefresh: (() -> Unit)? = null
+        set(value) {
+            field = value
+            if (value != null && refreshRequested) {
+                refreshRequested = false
+                value()
+            }
+        }
+
+    fun requestRefresh() {
+        refreshRequested = true
+        onRefresh?.let {
+            refreshRequested = false
+            it()
+        }
+    }
+}
+
 object GithubUpdater {
     // Pobieranie ustawień z build.gradle (BuildConfig)
     private const val GITHUB_OWNER = BuildConfig.GITHUB_OWNER
@@ -2489,7 +2535,9 @@ object GithubUpdater {
                         ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     )
                 }
-                return@withContext true
+                // Nie zgłaszaj sukcesu: użytkownik musi wrócić do aplikacji po nadaniu zgody,
+                // a wtedy ponownie sprawdzimy rzeczywistą wersję.
+                return@withContext false
             }
 
             val intent = Intent(Intent.ACTION_VIEW).apply {
