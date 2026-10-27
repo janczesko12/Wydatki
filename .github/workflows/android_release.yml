@@ -46,8 +46,20 @@ jobs:
         env:
           BUILD_TOOLS_VERSION: "35.0.0"
 
+      # Ręczne uruchomienie na branchu nie ma taga, więc APK zapisujemy jako artifact.
+      - name: Upload APK artifact (manual run)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wydatki-APK
+          path: ${{ steps.sign_app.outputs.signedReleaseFile }}
+          if-no-files-found: error
+          retention-days: 14
+
+      # Release tworzony jest tylko wtedy, gdy workflow uruchomiono przez tag v*.
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.sign_app.outputs.signedReleaseFile }}
         env:
