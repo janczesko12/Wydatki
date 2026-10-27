@@ -1,11 +1,19 @@
 package com.example.wydatki
 
 import android.annotation.SuppressLint
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import androidx.core.app.NotificationCompat
+import android.provider.MediaStore
 import android.provider.Settings as AndroidSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -13,12 +21,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricPrompt
 import androidx.fragment.app.FragmentActivity
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -33,11 +35,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -80,7 +86,7 @@ import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.animation.animateContentSize
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -92,6 +98,12 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.Worker
+import androidx.work.WorkerParameters
+import com.google.android.gms.tasks.Tasks
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
@@ -122,6 +134,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        BackupScheduler.schedule(this)
         store = AppStore(this)
         setContent {
             MaterialTheme {
@@ -131,18 +144,20 @@ class MainActivity : FragmentActivity() {
             }
         }
     }
-
-    override fun onResume() {
-        super.onResume()
-        // Po powrocie z instalatora Androida sprawdź, czy nowa wersja rzeczywiście jest już aktywna.
-        if (::store.isInitialized) {
-            UpdateRefreshBus.requestRefresh()
-        }
-    }
 }
 
-class AppStore(context: Context) {
+class AppStore(context: Context, startCloud: Boolean = true) {
     private val prefs = context.getSharedPreferences("wydatki_data", Context.MODE_PRIVATE)
+
+    companion object {
+        private const val PREF_SYNC_BASE_REVISION = "sync_base_revision"
+        private const val PREF_SYNC_DIRTY = "sync_dirty"
+        private const val PREF_LOCAL_DATA_VERSION = "local_data_version"
+        private const val PREF_SYNC_DEVICE_ID = "sync_device_id"
+        private const val PREF_LAST_BACKUP_AT = "last_backup_at"
+        private const val PREF_LAST_CONFLICT_BACKUP = "last_conflict_backup"
+    }
+
     var categories by mutableStateOf(loadCategories())
         private set
     var expenses by mutableStateOf(loadExpenses())
@@ -151,13 +166,33 @@ class AppStore(context: Context) {
         private set
     var cloudStatus by mutableStateOf("Chmura: przygotowywanie…")
         private set
-    var securityPin by mutableStateOf(prefs?.getString("security_pin", null))
+    var securityPin by mutableStateOf(prefs.getString("security_pin", null))
         private set
-    var biometricEnabled by mutableStateOf(prefs?.getBoolean("biometric_enabled", false) ?: false)
+    var biometricEnabled by mutableStateOf(prefs.getBoolean("biometric_enabled", false))
         private set
 
+    val syncBaseRevision: Long
+        get() = prefs.getLong(PREF_SYNC_BASE_REVISION, 0L)
+
+    val syncDirty: Boolean
+        get() = prefs.getBoolean(PREF_SYNC_DIRTY, false)
+
+    val localDataVersion: Long
+        get() = prefs.getLong(PREF_LOCAL_DATA_VERSION, 0L)
+
+    val syncDeviceId: String
+        get() {
+            val existing = prefs.getString(PREF_SYNC_DEVICE_ID, null)
+            if (!existing.isNullOrBlank()) return existing
+            val created = UUID.randomUUID().toString()
+            prefs.edit { putString(PREF_SYNC_DEVICE_ID, created) }
+            return created
+        }
+
     init {
-        FirebaseCloud.start(context, this)
+        if (startCloud) {
+            FirebaseCloud.start(context, this)
+        }
     }
 
     fun addExpense(x: Expense) {
@@ -200,11 +235,17 @@ class AppStore(context: Context) {
         categories = categories.filterNot { it.id == id }; saveAll(); FirebaseCloud.push(this)
     }
 
-    fun replaceAll(c: List<Category>, e: List<Expense>, i: List<Income>, push: Boolean = false) {
+    fun replaceAll(
+        c: List<Category>,
+        e: List<Expense>,
+        i: List<Income>,
+        push: Boolean = false,
+        markDirty: Boolean = true
+    ) {
         categories = c
         expenses = e
         incomes = i
-        saveAll()
+        saveAll(markDirty)
         if (push) FirebaseCloud.push(this)
     }
 
@@ -212,14 +253,36 @@ class AppStore(context: Context) {
         cloudStatus = value
     }
 
+    fun markSynced(serverRevision: Long, uploadedDataVersion: Long) {
+        val currentVersion = prefs.getLong(PREF_LOCAL_DATA_VERSION, 0L)
+        val stillSameData = currentVersion == uploadedDataVersion
+        prefs.edit {
+            putLong(PREF_SYNC_BASE_REVISION, serverRevision)
+            putBoolean(PREF_SYNC_DIRTY, !stillSameData)
+            putString(PREF_LAST_BACKUP_AT, currentDateTime())
+        }
+        cloudStatus = if (stillSameData) "Chmura: zapisano" else "Chmura: zapisano (nowe zmiany oczekują)"
+    }
+
+    fun keepLocalAndAdoptCloudRevision(serverRevision: Long) {
+        prefs.edit {
+            putLong(PREF_SYNC_BASE_REVISION, serverRevision)
+            putBoolean(PREF_SYNC_DIRTY, true)
+        }
+    }
+
+    fun saveConflictBackup(json: String) {
+        prefs.edit { putString(PREF_LAST_CONFLICT_BACKUP, json) }
+    }
+
     fun setPin(pin: String?) {
         securityPin = pin
-        prefs?.edit()?.putString("security_pin", pin)?.apply()
+        prefs?.edit()?.putString("security_pin", pin)?.commit()
     }
 
     fun setBiometric(enabled: Boolean) {
         biometricEnabled = enabled
-        prefs?.edit()?.putBoolean("biometric_enabled", enabled)?.apply()
+        prefs?.edit()?.putBoolean("biometric_enabled", enabled)?.commit()
     }
 
     fun exportJson(): String {
@@ -301,18 +364,26 @@ class AppStore(context: Context) {
                     )
                 }
             }
-            replaceAll(c, e, i, true)
+
+            // Import z pliku jest zmianą użytkownika, więc oznaczamy lokalny stan jako oczekujący synchronizacji.
+            replaceAll(c, e, i, true, true)
             true
         } catch (_: Exception) {
             false
         }
     }
 
-    private fun saveAll() {
+    private fun saveAll(markDirty: Boolean = true) {
         prefs.edit {
             putString("categories", categoriesJson())
             putString("expenses", expensesJson())
             putString("incomes", incomesJson())
+
+            if (markDirty) {
+                val nextVersion = prefs.getLong(PREF_LOCAL_DATA_VERSION, 0L) + 1L
+                putLong(PREF_LOCAL_DATA_VERSION, nextVersion)
+                putBoolean(PREF_SYNC_DIRTY, true)
+            }
         }
     }
 
@@ -420,13 +491,13 @@ class AppStore(context: Context) {
 
 
 
-    fun importJsonFromCloud(raw: String) {
+    fun importJsonFromCloud(raw: String, serverRevision: Long = syncBaseRevision) {
         try {
             val o = JSONObject(raw)
             val ca = o.getJSONArray("categories")
             val ea = o.getJSONArray("expenses")
             val ia = o.getJSONArray("incomes")
-            val c = List(ca.length()) { n ->
+            val cCloud = List(ca.length()) { n ->
                 ca.getJSONObject(n).let {
                     Category(
                         it.getString("id"),
@@ -436,7 +507,7 @@ class AppStore(context: Context) {
                     )
                 }
             }
-            val e = List(ea.length()) { n ->
+            val eCloud = List(ea.length()) { n ->
                 ea.getJSONObject(n).let {
                     Expense(
                         it.optString("id", UUID.randomUUID().toString()),
@@ -449,7 +520,7 @@ class AppStore(context: Context) {
                     )
                 }
             }
-            val i = List(ia.length()) { n ->
+            val iCloud = List(ia.length()) { n ->
                 ia.getJSONObject(n).let {
                     Income(
                         it.getString("id"),
@@ -460,7 +531,11 @@ class AppStore(context: Context) {
                     )
                 }
             }
-            replaceAll(c, e, i, false)
+
+            // Chmurowa wersja jest traktowana jako kompletna wersja stanu.
+            // Nie scalaj automatycznie starszego lokalnego stanu z nowszą chmurą.
+            replaceAll(cCloud, eCloud, iCloud, false, false)
+            markSynced(serverRevision, localDataVersion)
             updateCloudStatus("Chmura: zsynchronizowano")
         } catch (_: Exception) {
             updateCloudStatus("Chmura: nieprawidłowe dane")
@@ -477,6 +552,7 @@ object FirebaseCloud {
 
     fun start(context: Context, appStore: AppStore) {
         store = WeakReference(appStore)
+        BackupScheduler.schedule(context)
 
         try {
             val appContext = context.applicationContext
@@ -575,22 +651,144 @@ object FirebaseCloud {
     fun logout() {
         auth?.signOut()
         ready = false
-        store?.get()?.updateCloudStatus("Chmura: wylogowano")
+        store?.get()?.let {
+            it.replaceAll(emptyList(), emptyList(), emptyList(), false)
+            it.updateCloudStatus("Chmura: wylogowano")
+        }
     }
 
     fun isConfigured() = auth != null && db != null
     fun isLoggedIn() = auth?.currentUser != null
 
+    suspend fun backupBeforeUpdate(s: AppStore, json: String): Boolean {
+        val user = auth?.currentUser ?: return true
+        val firestore = db ?: return false
+        if (!ready) return false
+
+        return try {
+            val root = firestore.collection("wydatki").document(user.uid)
+            val snapshotVersion = s.localDataVersion
+
+            val result = Tasks.await(
+                firestore.runTransaction { transaction ->
+                    val current = transaction.get(root)
+                    val cloudRevision = current.getLong("revision") ?: 0L
+                    val newRevision = cloudRevision + 1L
+
+                    val payload = hashMapOf<String, Any>(
+                        "data" to json,
+                        "revision" to newRevision,
+                        "writerDeviceId" to s.syncDeviceId,
+                        "writerDataVersion" to snapshotVersion,
+                        "updatedAt" to FieldValue.serverTimestamp(),
+                        "backupReason" to "before_app_update"
+                    )
+
+                    transaction.set(root, payload)
+                    mapOf<String, Any>(
+                        "revision" to newRevision
+                    )
+                },
+                30,
+                java.util.concurrent.TimeUnit.SECONDS
+            )
+
+            val revision = (result["revision"] as? Long) ?: 0L
+            s.markSynced(revision, snapshotVersion)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     fun push(s: AppStore) {
         if (!ready) return
         val user = auth?.currentUser ?: return
-        val root = db?.collection("wydatki")?.document(user.uid) ?: return
+        val firestore = db ?: return
+        val root = firestore.collection("wydatki").document(user.uid)
+        val snapshotJson = s.exportJson()
+        val snapshotVersion = s.localDataVersion
+
+        firestore.runTransaction { transaction ->
+            val current = transaction.get(root)
+            val cloudRevision = current.getLong("revision") ?: 0L
+            val baseRevision = s.syncBaseRevision
+
+            val hasRevision = current.contains("revision")
+
+            // Stary dokument bez rewizji jest traktowany ostrożnie.
+            if (current.exists() && !hasRevision) {
+                return@runTransaction mapOf<String, Any>(
+                    "result" to "legacy",
+                    "revision" to 0L,
+                    "data" to (current.getString("data") ?: "")
+                )
+            }
+
+            if (current.exists() && s.syncDirty && cloudRevision != baseRevision) {
+                val cloudWriter = current.getString("writerDeviceId")
+                val cloudDataVersion = current.getLong("writerDataVersion") ?: 0L
+                val currentLocalVersion = s.localDataVersion
+
+                // Gdy to wcześniejszy zapis z tego samego urządzenia, a lokalnie
+                // istnieje jeszcze nowsza wersja, bezpiecznie ponów wysyłkę lokalnych danych.
+                if (cloudWriter == s.syncDeviceId && cloudDataVersion < currentLocalVersion) {
+                    return@runTransaction mapOf<String, Any>(
+                        "result" to "local_newer",
+                        "revision" to cloudRevision
+                    )
+                }
+
+                return@runTransaction mapOf<String, Any>(
+                    "result" to "conflict",
+                    "revision" to cloudRevision,
+                    "data" to (current.getString("data") ?: "")
+                )
+            }
+
+            val newRevision = cloudRevision + 1L
+            val payload = hashMapOf<String, Any>(
+                "data" to snapshotJson,
+                "revision" to newRevision,
+                "writerDeviceId" to s.syncDeviceId,
+                "writerDataVersion" to snapshotVersion,
+                "updatedAt" to FieldValue.serverTimestamp()
+            )
+            transaction.set(root, payload)
+            mapOf<String, Any>("result" to "uploaded", "revision" to newRevision)
+        }.addOnSuccessListener { result ->
+            if (result["result"] == "local_newer") {
+                val cloudRevision = (result["revision"] as? Long) ?: 0L
+                s.keepLocalAndAdoptCloudRevision(cloudRevision)
+                s.updateCloudStatus("Chmura: ponawiam zapis nowszych danych…")
+                push(s)
+            } else if (result["result"] == "conflict" || result["result"] == "legacy") {
+                val cloudRevision = (result["revision"] as? Long) ?: 0L
+                val cloudJson = result["data"] as? String ?: ""
+                s.saveConflictBackup(snapshotJson)
+                if (cloudJson.isNotBlank()) {
+                    s.importJsonFromCloud(cloudJson, if (cloudRevision > 0L) cloudRevision else 1L)
+                    if (result["result"] == "legacy") {
+                        migrateLegacyDocument(user.uid, cloudJson)
+                    }
+                }
+                s.updateCloudStatus("Chmura: konflikt — zachowano nowszą wersję")
+            } else {
+                val revision = (result["revision"] as? Long) ?: 0L
+                s.markSynced(revision, snapshotVersion)
+            }
+        }.addOnFailureListener { s.updateCloudStatus("Chmura: błąd zapisu") }
+    }
+
+    private fun migrateLegacyDocument(uid: String, json: String) {
+        val firestore = db ?: return
+        val root = firestore.collection("wydatki").document(uid)
         val payload = hashMapOf<String, Any>(
-            "data" to s.exportJson(),
+            "data" to json,
+            "revision" to 1L,
             "updatedAt" to FieldValue.serverTimestamp()
         )
-        root.set(payload).addOnSuccessListener { s.updateCloudStatus("Chmura: zapisano") }
-            .addOnFailureListener { s.updateCloudStatus("Chmura: błąd zapisu") }
+        root.set(payload)
     }
 
     private fun pull() {
@@ -599,10 +797,275 @@ object FirebaseCloud {
         db?.collection("wydatki")?.document(user.uid)?.get()
             ?.addOnSuccessListener { doc ->
                 val raw = doc.getString("data")
-                if (!raw.isNullOrBlank()) s.importJsonFromCloud(raw)
-                else push(s)
+                val cloudRevision = doc.getLong("revision") ?: 0L
+
+                if (!doc.exists() || raw.isNullOrBlank()) {
+                    push(s)
+                    return@addOnSuccessListener
+                }
+
+                if (!doc.contains("revision")) {
+                    // Migracja starego dokumentu: najpierw zachowaj lokalny stan,
+                    // potem przyjmij istniejącą wersję chmurową i dopiero ją oznacz rewizją.
+                    if (s.syncDirty) s.saveConflictBackup(s.exportJson())
+                    s.importJsonFromCloud(raw, 1L)
+                    migrateLegacyDocument(user.uid, raw)
+                    s.updateCloudStatus("Chmura: zsynchronizowano (migracja)")
+                } else if (s.syncDirty && s.syncBaseRevision != cloudRevision) {
+                    s.saveConflictBackup(s.exportJson())
+                    s.importJsonFromCloud(raw, cloudRevision)
+                    s.updateCloudStatus("Chmura: konflikt — zachowano nowszą wersję")
+                } else if (!s.syncDirty && s.syncBaseRevision != cloudRevision) {
+                    s.importJsonFromCloud(raw, cloudRevision)
+                } else if (s.syncDirty) {
+                    push(s)
+                } else {
+                    // Nadal wykonujemy synchronizację, więc okresowy backup będzie mógł
+                    // podbić rewizję, ale tylko gdy nikt nie zmienił dokumentu po drodze.
+                    push(s)
+                }
             }
             ?.addOnFailureListener { s.updateCloudStatus("Chmura: błąd odczytu") }
+    }
+}
+
+
+private const val AUTO_JSON_BACKUP_NAME = "Wydatki-auto-backup.json"
+private const val AUTO_JSON_BACKUP_FOLDER = "Wydatki"
+
+private fun saveJsonToDownloads(
+    context: Context,
+    json: String,
+    fileName: String
+): Boolean {
+    return try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = context.contentResolver
+            val downloads =
+                MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val relativePath =
+                "${Environment.DIRECTORY_DOWNLOADS}/$AUTO_JSON_BACKUP_FOLDER/"
+
+            var fileUri: Uri? = null
+
+            resolver.query(
+                downloads,
+                arrayOf(MediaStore.Downloads._ID),
+                "${MediaStore.Downloads.DISPLAY_NAME} = ? AND ${MediaStore.Downloads.RELATIVE_PATH} = ?",
+                arrayOf(fileName, relativePath),
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(
+                        cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID)
+                    )
+                    fileUri = Uri.withAppendedPath(downloads, id.toString())
+                }
+            }
+
+            if (fileUri == null) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, "application/json")
+                    put(MediaStore.Downloads.RELATIVE_PATH, relativePath)
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                fileUri = resolver.insert(downloads, values)
+            }
+
+            val uri = fileUri ?: return false
+
+            resolver.openOutputStream(uri, "wt")?.use { output ->
+                output.write(json.toByteArray(Charsets.UTF_8))
+                output.flush()
+            } ?: return false
+
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.IS_PENDING, 0)
+            }
+            resolver.update(uri, values, null, null)
+            true
+        } else {
+            val baseDir = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.FROYO) {
+                context.getExternalFilesDir("Documents") ?: context.filesDir
+            } else {
+                context.filesDir
+            }
+            val dir = File(baseDir, AUTO_JSON_BACKUP_FOLDER)
+            if (!dir.exists()) dir.mkdirs()
+
+            File(dir, fileName).writeText(json, Charsets.UTF_8)
+            true
+        }
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private fun saveAutomaticJsonBackup(context: Context, json: String): Boolean {
+    val ok = saveJsonToDownloads(context, json, AUTO_JSON_BACKUP_NAME)
+
+    if (ok) {
+        context.getSharedPreferences("wydatki_data", Context.MODE_PRIVATE)
+            .edit()
+            .putString("last_local_json_backup_at", currentDateTime())
+            .commit()
+    }
+
+    return ok
+}
+
+private fun savePreUpdateJsonBackup(
+    context: Context,
+    json: String,
+    versionTag: String
+): Boolean {
+    val safeTag = versionTag.replace(Regex("[^A-Za-z0-9._-]"), "_")
+    val fileName = "Wydatki-przed-aktualizacja-$safeTag.json"
+
+    val ok = saveJsonToDownloads(context, json, fileName)
+
+    if (ok) {
+        context.getSharedPreferences("wydatki_data", Context.MODE_PRIVATE)
+            .edit()
+            .putString("last_pre_update_backup_at", currentDateTime())
+            .putString("last_pre_update_backup_file", fileName)
+            .commit()
+    }
+
+    return ok
+}
+
+
+private const val FIRESTORE_BACKUP_WORK_NAME = "wydatki_firestore_backup_30m"
+
+object BackupScheduler {
+    fun schedule(context: Context) {
+        // Brak wymogu sieci: lokalna kopia JSON ma powstawać także offline.
+        // Sam zapis do Firebase zostanie ponowiony przez WorkManager po błędzie sieci.
+        val request = PeriodicWorkRequestBuilder<FirestoreBackupWorker>(
+            30L * 60L,
+            java.util.concurrent.TimeUnit.SECONDS
+        )
+            .build()
+
+        WorkManager.getInstance(context.applicationContext).enqueueUniquePeriodicWork(
+            FIRESTORE_BACKUP_WORK_NAME,
+            ExistingPeriodicWorkPolicy.KEEP,
+            request
+        )
+    }
+}
+
+class FirestoreBackupWorker(
+    appContext: Context,
+    workerParams: WorkerParameters
+) : Worker(appContext, workerParams) {
+
+    override fun doWork(): Result {
+        return try {
+            val context = applicationContext
+
+            // Co każde uruchomienie WorkManagera wykonywany jest pełny eksport
+            // aktualnych lokalnych danych aplikacji.
+            // Najpierw zapisujemy kopię JSON na telefonie, niezależnie od logowania Firebase.
+            val store = AppStore(context, startCloud = false)
+            val json = store.exportJson()
+            saveAutomaticJsonBackup(context, json)
+
+            val firebaseApp = FirebaseApp.getApps(context).firstOrNull()
+                ?: FirebaseApp.initializeApp(context)
+                ?: return Result.success()
+
+            val auth = FirebaseAuth.getInstance(firebaseApp)
+            val user = auth.currentUser ?: return Result.success()
+
+            val db = FirebaseFirestore.getInstance(firebaseApp)
+            val snapshotVersion = store.localDataVersion
+            val document = db.collection("wydatki").document(user.uid)
+
+            val result = Tasks.await(
+                db.runTransaction { transaction ->
+                    val current = transaction.get(document)
+                    val cloudRevision = current.getLong("revision") ?: 0L
+                    val baseRevision = store.syncBaseRevision
+                    val hasRevision = current.contains("revision")
+
+                    if (current.exists() && !hasRevision) {
+                        return@runTransaction mapOf<String, Any>(
+                            "result" to "legacy",
+                            "revision" to 0L,
+                            "data" to (current.getString("data") ?: "")
+                        )
+                    }
+
+                    if (current.exists() && store.syncDirty && cloudRevision != baseRevision) {
+                        val cloudWriter = current.getString("writerDeviceId")
+                        val cloudDataVersion = current.getLong("writerDataVersion") ?: 0L
+                        val currentLocalVersion = store.localDataVersion
+
+                        if (cloudWriter == store.syncDeviceId && cloudDataVersion < currentLocalVersion) {
+                            return@runTransaction mapOf<String, Any>(
+                                "result" to "local_newer",
+                                "revision" to cloudRevision
+                            )
+                        }
+
+                        return@runTransaction mapOf<String, Any>(
+                            "result" to "conflict",
+                            "revision" to cloudRevision,
+                            "data" to (current.getString("data") ?: "")
+                        )
+                    }
+
+                    val newRevision = cloudRevision + 1L
+                    val payload = hashMapOf<String, Any>(
+                        "data" to json,
+                        "revision" to newRevision,
+                        "writerDeviceId" to store.syncDeviceId,
+                        "writerDataVersion" to snapshotVersion,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                    transaction.set(document, payload)
+                    mapOf<String, Any>("result" to "uploaded", "revision" to newRevision)
+                },
+                30,
+                java.util.concurrent.TimeUnit.SECONDS
+            )
+
+            if (result["result"] == "local_newer") {
+                val cloudRevision = (result["revision"] as? Long) ?: 0L
+                store.keepLocalAndAdoptCloudRevision(cloudRevision)
+                Result.retry()
+            } else if (result["result"] == "conflict" || result["result"] == "legacy") {
+                val cloudRevision = (result["revision"] as? Long) ?: 0L
+                val cloudJson = result["data"] as? String ?: ""
+                store.saveConflictBackup(json)
+                if (cloudJson.isNotBlank()) {
+                    store.importJsonFromCloud(cloudJson, if (cloudRevision > 0L) cloudRevision else 1L)
+                    if (result["result"] == "legacy") {
+                        val payload = hashMapOf<String, Any>(
+                            "data" to cloudJson,
+                            "revision" to 1L,
+                            "writerDeviceId" to store.syncDeviceId,
+                            "writerDataVersion" to store.localDataVersion,
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                        Tasks.await(document.set(payload), 30, java.util.concurrent.TimeUnit.SECONDS)
+                    }
+                }
+                store.updateCloudStatus("Chmura: konflikt — zachowano nowszą wersję")
+                Result.success()
+            } else {
+                val revision = (result["revision"] as? Long) ?: 0L
+                store.markSynced(revision, snapshotVersion)
+                Result.success()
+            }
+        } catch (_: Exception) {
+            // Przy błędzie sieci/Firebase dane lokalne pozostają bez zmian,
+            // a WorkManager ponowi próbę.
+            Result.retry()
+        }
     }
 }
 
@@ -747,6 +1210,13 @@ fun WydatkiApp(store: AppStore) {
     var screen by remember { mutableStateOf("dashboard") }
     var selected by remember { mutableStateOf<Category?>(null) }
     var month by remember { mutableStateOf(currentMonth()) }
+    // Zachowuje dokładną pozycję przewinięcia pulpitu po wejściu do kategorii i powrocie.
+    val dashboardListState = rememberLazyListState()
+
+    // Pozycje list są trzymane poza ekranami, dzięki czemu scroll jest zachowany.
+    val categoryListStates = remember { mutableMapOf<String, LazyListState>() }
+    val expensesListState = remember { LazyListState() }
+
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -754,21 +1224,35 @@ fun WydatkiApp(store: AppStore) {
     var updateDownloading by remember { mutableStateOf(false) }
     var updateProgress by remember { mutableStateOf(0) }
     var updateError by remember { mutableStateOf("") }
-    var updateRefreshToken by remember { mutableIntStateOf(0) }
+
+    // Dostępna aktualizacja jest obsługiwana bezpośrednio w aplikacji.
+    // Nie otwieramy strony GitHub w przeglądarce.
 
     LaunchedEffect(Unit) {
-        availableRelease = GithubUpdater.check()
-    }
+        withContext(Dispatchers.IO) {
+            try {
+                val release = GithubUpdater.check(context)
+                if (release != null) {
+                    val backupJson = store.exportJson()
 
-    LaunchedEffect(updateRefreshToken) {
-        if (updateRefreshToken > 0) {
-            availableRelease = GithubUpdater.check()
+                    // ZAWSZE wykonaj kopię przed pokazaniem aktualizacji.
+                    // Lokalna kopia jest niezależna od Firebase i powstaje nawet offline.
+                    savePreUpdateJsonBackup(context, backupJson, release.tag)
+                    saveAutomaticJsonBackup(context, backupJson)
+
+                    // Jeżeli użytkownik jest zalogowany, dopisz pełną kopię także do Firestore.
+                    // Czekamy na zakończenie zapisu, zanim pokażemy ekran aktualizacji.
+                    withContext(Dispatchers.IO) {
+                        FirebaseCloud.backupBeforeUpdate(store, backupJson)
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        availableRelease = release
+                        showUpdateNotification(context, release.tag)
+                    }
+                }
+            } catch (_: Exception) {}
         }
-    }
-
-    DisposableEffect(Unit) {
-        UpdateRefreshBus.onRefresh = { updateRefreshToken++ }
-        onDispose { UpdateRefreshBus.onRefresh = null }
     }
 
     val selectedTab = when (screen) {
@@ -780,32 +1264,39 @@ fun WydatkiApp(store: AppStore) {
 
     Column(Modifier.fillMaxSize().background(Color(0xFFF6F8F7))) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            AnimatedContent(
-                targetState = screen,
-                transitionSpec = {
-                    fadeIn(animationSpec = androidx.compose.animation.core.tween(180)) togetherWith
-                            fadeOut(animationSpec = androidx.compose.animation.core.tween(120))
-                },
-                label = "screen_transition"
-            ) { currentScreen ->
-                when (currentScreen) {
-                    "dashboard" -> DashboardScreen(
-                        store, month,
-                        { month = it },
-                        { selected = it; screen = "category" },
-                        { screen = it }
-                    )
+            when (screen) {
+                "dashboard" -> DashboardScreen(
+                    store,
+                    month,
+                    { month = it },
+                    { selected = it; screen = "category" },
+                    { screen = it },
+                    dashboardListState
+                )
 
-                    "category" -> selected?.let {
-                        CategoryScreen(store, it, month) { screen = "dashboard" }
+                "category" -> selected?.let {
+                    val stateKey = "${it.id}|$month"
+                    val categoryListState = categoryListStates.getOrPut(stateKey) {
+                        LazyListState()
                     }
 
-                    "expenses" -> ExpensesScreen(store, month) { screen = "dashboard" }
-                    "income" -> IncomeScreen(store, month) { screen = "dashboard" }
-                    "stats" -> StatisticsScreen(store, month, { month = it }) { screen = "dashboard" }
-                    "search" -> SearchScreen(store) { screen = "dashboard" }
-                    "settings" -> SettingsScreen(store) { screen = "dashboard" }
+                    CategoryScreen(
+                        store,
+                        it,
+                        month,
+                        categoryListState
+                    ) { screen = "dashboard" }
                 }
+
+                "expenses" -> ExpensesScreen(
+                    store,
+                    month,
+                    expensesListState
+                ) { screen = "dashboard" }
+                "income" -> IncomeScreen(store, month) { screen = "dashboard" }
+                "stats" -> StatisticsScreen(store, month, { month = it }) { screen = "dashboard" }
+                "search" -> SearchScreen(store) { screen = "dashboard" }
+                "settings" -> SettingsScreen(store) { screen = "dashboard" }
             }
         }
 
@@ -851,10 +1342,7 @@ fun WydatkiApp(store: AppStore) {
                             updateDownloading = false
 
                             if (success) {
-                                // Ukryj komunikat na czas instalacji. Po powrocie z instalatora
-                                // onResume ponownie sprawdzi wersję zainstalowaną na urządzeniu.
                                 availableRelease = null
-                                UpdateRefreshBus.refreshRequested = true
                             } else {
                                 updateError = "Nie udało się pobrać aktualizacji."
                             }
@@ -957,7 +1445,8 @@ fun DashboardScreen(
     month: String,
     setMonth: (String) -> Unit,
     category: (Category) -> Unit,
-    tab: (String) -> Unit
+    tab: (String) -> Unit,
+    listState: LazyListState
 ) {
     val ex = store.expenses.filter { monthOf(it.date) == month }
     val inc = store.incomes.filter { monthOf(it.date) == month }
@@ -966,13 +1455,20 @@ fun DashboardScreen(
     Scaffold(
         containerColor = Color(0xFFF6F8F7)) { p ->
         LazyColumn(
-            Modifier.fillMaxSize().padding(p).padding(horizontal = 16.dp),
+            state = listState,
+            modifier = Modifier.fillMaxSize().padding(p).padding(horizontal = 16.dp),
             contentPadding = PaddingValues(bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
                 MonthHeader(month, setMonth)
-                SummarySection(income, expenses, income - expenses)
+                SummarySection(
+                    income,
+                    expenses,
+                    income - expenses,
+                    onIncomeClick = { tab("income") },
+                    onExpensesClick = { tab("expenses") }
+                )
                 Row(
                     Modifier.fillMaxWidth().padding(top = 10.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -987,10 +1483,12 @@ fun DashboardScreen(
                 color = Color(0xFF455A64)
             )
             }
-            items(store.categories) { c ->
-                CategoryCard(
-                    c,
-                    ex.filter { it.categoryId == c.id }.sumOf { it.amount }) { category(c) }
+            itemsIndexed(store.categories, key = { _, c -> c.id }) { index, c ->
+                PortfolioReveal(index) {
+                    CategoryCard(
+                        c,
+                        ex.filter { it.categoryId == c.id }.sumOf { it.amount }) { category(c) }
+                }
             }
         }
     }
@@ -1046,15 +1544,29 @@ fun MonthHeader(month: String, set: (String) -> Unit) {
 }
 
 @Composable
-fun SummarySection(income: Double, expenses: Double, remaining: Double) {
+fun SummarySection(
+    income: Double,
+    expenses: Double,
+    remaining: Double,
+    onIncomeClick: (() -> Unit)? = null,
+    onExpensesClick: (() -> Unit)? = null
+) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        SummaryCard(Modifier.weight(1f), "DOCHÓD", income, Color(0xFFE2F4E9), Color(0xFF087443))
+        SummaryCard(
+            Modifier.weight(1f),
+            "DOCHÓD",
+            income,
+            Color(0xFFE2F4E9),
+            Color(0xFF087443),
+            onClick = onIncomeClick
+        )
         SummaryCard(
             Modifier.weight(1f),
             "WYDATKI",
             expenses,
             Color(0xFFFCE7E5),
-            Color(0xFFC62828)
+            Color(0xFFC62828),
+            onClick = onExpensesClick
         )
     }
     Spacer(Modifier.height(8.dp)); SummaryCard(
@@ -1067,9 +1579,16 @@ fun SummarySection(income: Double, expenses: Double, remaining: Double) {
 }
 
 @Composable
-fun SummaryCard(modifier: Modifier, title: String, amount: Double, bg: Color, fg: Color) {
+fun SummaryCard(
+    modifier: Modifier,
+    title: String,
+    amount: Double,
+    bg: Color,
+    fg: Color,
+    onClick: (() -> Unit)? = null
+) {
     Card(
-        modifier,
+        if (onClick != null) modifier.clickable(onClick = onClick) else modifier,
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(bg)
     ) {
@@ -1087,9 +1606,21 @@ fun SummaryCard(modifier: Modifier, title: String, amount: Double, bg: Color, fg
 }
 
 @Composable
+fun PortfolioReveal(index: Int = 0, content: @Composable () -> Unit) {
+    // Bez animacji — element pojawia się natychmiast.
+    Box(
+        Modifier.fillMaxWidth()
+    ) {
+        content()
+    }
+}
+
+@Composable
 fun CategoryCard(c: Category, amount: Double, onClick: () -> Unit) {
     Card(
-        Modifier.fillMaxWidth().clickable(onClick = onClick),
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
         shape = RoundedCornerShape(14.dp),
         colors = CardDefaults.cardColors(Color.White)
     ) {
@@ -1115,11 +1646,19 @@ fun CategoryCard(c: Category, amount: Double, onClick: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CategoryScreen(store: AppStore, c: Category, month: String, back: () -> Unit) {
+fun CategoryScreen(
+    store: AppStore,
+    c: Category,
+    month: String,
+    listState: LazyListState,
+    back: () -> Unit
+) {
     var dialog by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Expense?>(null) }
     val list = store.expenses.filter { it.categoryId == c.id && monthOf(it.date) == month }
         .sortedByDescending { it.createdAt.ifBlank { it.date } }
+    val totalSpent = list.sumOf { it.amount }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -1133,24 +1672,20 @@ fun CategoryScreen(store: AppStore, c: Category, month: String, back: () -> Unit
             ) { Icon(Icons.Default.Add, "Dodaj", tint = Color.White) }
         }) { p ->
         LazyColumn(
-            Modifier.fillMaxSize().padding(p).padding(16.dp),
+            state = listState,
+            modifier = Modifier.fillMaxSize().padding(p).padding(16.dp),
             contentPadding = PaddingValues(bottom = 100.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             item {
-                SummaryCard(
-                    Modifier.fillMaxWidth(),
-                    "SUMA ${monthLabel(month)}",
-                    list.sumOf { it.amount },
-                    Color(0xFFE2F4E9),
-                    Color(0xFF087443)
-                ); Spacer(Modifier.height(8.dp))
             }
             if (list.isEmpty()) item { Empty("Brak wydatków w tej kategorii.") }
-            items(list) { e ->
-                ExpenseCard(e,
-                    { editing = e; dialog = true },
-                    { store.deleteExpense(e.id) })
+            itemsIndexed(list, key = { _, e -> e.id }) { index, e ->
+                PortfolioReveal(index) {
+                    ExpenseCard(e,
+                        { editing = e; dialog = true },
+                        { store.deleteExpense(e.id) })
+                }
             }
         }
     }
@@ -1162,6 +1697,32 @@ fun CategoryScreen(store: AppStore, c: Category, month: String, back: () -> Unit
             dialog = false
         }) {
         if (editing == null) store.addExpense(it) else store.updateExpense(it); dialog = false
+    }
+}
+
+@Composable
+fun CategoryMetricRow(label: String, value: String, subtitle: String? = null) {
+    Row(
+        Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(label, fontSize = 13.sp, color = Color(0xFF455A64))
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    subtitle,
+                    fontSize = 11.sp,
+                    color = Color.Gray,
+                    maxLines = 1
+                )
+            }
+        }
+        Text(
+            value,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color(0xFF263238)
+        )
     }
 }
 
@@ -1214,7 +1775,7 @@ fun ExpenseDialog(
     }
     var desc by remember { mutableStateOf(initial?.description ?: "") }
     var date by remember {
-        mutableStateOf(initial?.date ?: if (today().startsWith(month)) today() else "$month-01")
+        mutableStateOf(initial?.date ?: today())
     }
     var note by remember { mutableStateOf(initial?.note ?: "") }
     var error by remember { mutableStateOf("") }
@@ -1292,7 +1853,14 @@ fun ExpenseDialog(
         dismissButton = { TextButton(dismiss) { Text("ANULUJ") } })
 
     if (showDatePicker) {
-        val state = rememberDatePickerState()
+        val state = rememberDatePickerState(
+            initialSelectedDateMillis = Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+        )
         DatePickerDialog(
             onDismissRequest = { showDatePicker = false },
             confirmButton = {
@@ -1311,7 +1879,12 @@ fun ExpenseDialog(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ExpensesScreen(store: AppStore, month: String, back: () -> Unit) {
+fun ExpensesScreen(
+    store: AppStore,
+    month: String,
+    listState: LazyListState,
+    back: () -> Unit
+) {
     var query by remember { mutableStateOf("") }
     var dialog by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Expense?>(null) }
@@ -1334,7 +1907,8 @@ fun ExpensesScreen(store: AppStore, month: String, back: () -> Unit) {
             ) { Icon(Icons.Default.Add, "Dodaj", tint = Color.White) }
         }) { p ->
         LazyColumn(
-            Modifier.fillMaxSize().padding(p).padding(16.dp),
+            state = listState,
+            modifier = Modifier.fillMaxSize().padding(p).padding(16.dp),
             contentPadding = PaddingValues(bottom = 100.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -1347,10 +1921,12 @@ fun ExpensesScreen(store: AppStore, month: String, back: () -> Unit) {
                     singleLine = true
                 )
             }
-            items(list) { e ->
-                ExpenseCard(e,
-                    { editing = e; dialog = true },
-                    { store.deleteExpense(e.id) })
+            itemsIndexed(list, key = { _, e -> e.id }) { index, e ->
+                PortfolioReveal(index) {
+                    ExpenseCard(e,
+                        { editing = e; dialog = true },
+                        { store.deleteExpense(e.id) })
+                }
             }; if (list.isEmpty()) item { Empty("Brak wydatków.") }
         }
     }
@@ -1389,14 +1965,41 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
     val expenses = dateFilteredExpenses.filter {
         selectedCategoryId == "all" || it.categoryId == selectedCategoryId
     }
-    
+
     val income = if (viewMode == "year") {
         store.incomes.filter { monthOf(it.date).startsWith("$selectedYear-") }.sumOf { it.amount }
     } else {
         store.incomes.filter { it.date in startDate..endDate }.sumOf { it.amount }
     }
-    
+
     val total = expenses.sumOf { it.amount }
+    val biggestExpense = expenses.maxByOrNull { it.amount }
+    val averagePerTransaction = if (expenses.isNotEmpty()) total / expenses.size else 0.0
+    val periodMonths = if (viewMode == "year") {
+        12
+    } else {
+        val from = minOf(startDate, endDate)
+        val to = maxOf(startDate, endDate)
+        val fromYear = from.take(4).toIntOrNull() ?: 0
+        val fromMonth = from.substring(5, 7).toIntOrNull() ?: 1
+        val toYear = to.take(4).toIntOrNull() ?: fromYear
+        val toMonth = to.substring(5, 7).toIntOrNull() ?: fromMonth
+        ((toYear - fromYear) * 12 + (toMonth - fromMonth) + 1).coerceAtLeast(1)
+    }
+    val averagePerMonth = total / periodMonths.toDouble()
+    val periodDays = if (viewMode == "year") {
+        Calendar.getInstance().apply {
+            set(Calendar.YEAR, selectedYear)
+        }.getActualMaximum(Calendar.DAY_OF_YEAR)
+    } else {
+        val from = minOf(startDate, endDate)
+        val to = maxOf(startDate, endDate)
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val fromMillis = dateFormat.parse(from)?.time ?: 0L
+        val toMillis = dateFormat.parse(to)?.time ?: fromMillis
+        (((toMillis - fromMillis) / (24L * 60L * 60L * 1000L)) + 1L).coerceAtLeast(1L).toInt()
+    }.coerceAtLeast(1)
+    val averagePerDay = total / periodDays.toDouble()
 
     val grouped = store.categories.map { category ->
         category to expenses.filter { it.categoryId == category.id }.sumOf { it.amount }
@@ -1404,13 +2007,10 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
 
     val monthExpenses = store.expenses.filter {
         monthOf(it.date) == month &&
-            (selectedCategoryId == "all" || it.categoryId == selectedCategoryId)
+                (selectedCategoryId == "all" || it.categoryId == selectedCategoryId)
     }
     val monthTotal = monthExpenses.sumOf { it.amount }
     val monthIncome = store.incomes.filter { monthOf(it.date) == month }.sumOf { it.amount }
-    
-    val avg = if (expenses.isEmpty()) 0.0
-    else total / expenses.map { it.date.take(10) }.filter { it.isNotBlank() }.distinct().size
 
     Column(Modifier.fillMaxSize().background(Color(0xFFF6F8F7))) {
         Row(
@@ -1541,7 +2141,7 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Text(
-                                        if (selectedCategoryId == "all") "📊  Wszystkie kategorie" else (selectedCategory?.emoji ?: "💰") + "  " + (selectedCategory?.name ?: "Kategoria"),
+                                        if (selectedCategoryId == "all") "📊  Wszystkie kategorie" else "${selectedCategory?.emoji ?: "💰"}  ${selectedCategory?.name ?: "Kategoria"}",
                                         modifier = Modifier.weight(1f),
                                         fontWeight = FontWeight.SemiBold,
                                         color = Color(0xFF1F513E)
@@ -1559,7 +2159,7 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                                 )
                                 store.categories.forEach { category ->
                                     DropdownMenuItem(
-                                        text = { Text(category.emoji + "  " + category.name) },
+                                        text = { Text("${category.emoji}  ${category.name}") },
                                         onClick = { selectedCategoryId = category.id; categoryMenuExpanded = false }
                                     )
                                 }
@@ -1578,6 +2178,25 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                             fontSize = 12.sp,
                             color = Color.Gray
                         )
+                        Spacer(Modifier.height(14.dp))
+                        Text(
+                            "ANALIZA WYDATKÓW",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF455A64)
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        CategoryMetricRow("Łącznie wydano", money(total))
+                        Spacer(Modifier.height(8.dp))
+                        CategoryMetricRow("Średnio / dzień", money(averagePerDay))
+                        Spacer(Modifier.height(8.dp))
+                        CategoryMetricRow("Średni wydatek w miesiącu", money(averagePerMonth))
+                        Spacer(Modifier.height(8.dp))
+                        CategoryMetricRow(
+                            "Największy wydatek",
+                            biggestExpense?.let { money(it.amount) } ?: money(0.0),
+                            biggestExpense?.let { it.description.ifBlank { "Wydatek" } }
+                        )
                     }
                 }
             }
@@ -1591,7 +2210,7 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                     val ym = String.format(Locale.US, "%04d-%02d", selectedYear, monthNumber)
                     val mExpenses = store.expenses.filter {
                         monthOf(it.date) == ym &&
-                            (selectedCategoryId == "all" || it.categoryId == selectedCategoryId)
+                                (selectedCategoryId == "all" || it.categoryId == selectedCategoryId)
                     }.sumOf { it.amount }
                     val mIncome = store.incomes.filter { monthOf(it.date) == ym }.sumOf { it.amount }
                     val active = ym == month
@@ -1643,8 +2262,8 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                 item {
                     SummaryCard(
                         Modifier.fillMaxWidth(),
-                        "ŚREDNIO / DZIEŃ",
-                        if (monthExpenses.isEmpty()) 0.0 else monthTotal / monthExpenses.map { it.date.take(10) }.filter { it.isNotBlank() }.distinct().size,
+                        "POZOSTAŁO",
+                        monthIncome - monthTotal,
                         Color(0xFFE5F1F8),
                         Color(0xFF156082)
                     )
@@ -1662,8 +2281,8 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                 item {
                     SummaryCard(
                         Modifier.fillMaxWidth(),
-                        "ŚREDNIO / DZIEŃ",
-                        avg,
+                        "POZOSTAŁO",
+                        income - total,
                         Color(0xFFE5F1F8),
                         Color(0xFF156082)
                     )
@@ -1681,7 +2300,7 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
             } else {
                 grouped
             }
-            
+
             val displayTotal = if (viewMode == "year") monthTotal else total
 
             if (displayGrouped.isNotEmpty()) {
@@ -1732,9 +2351,16 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
             }
         }
     }
-    
+
     if (datePickerTarget != null) {
-        val state = rememberDatePickerState()
+        val state = rememberDatePickerState(
+            initialSelectedDateMillis = Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+        )
         DatePickerDialog(
             onDismissRequest = { datePickerTarget = null },
             confirmButton = {
@@ -1836,10 +2462,12 @@ fun IncomeScreen(store: AppStore, month: String, back: () -> Unit) {
                     Color(0xFF087443)
                 )
             }
-            items(list) { i ->
-                IncomeCard(i,
-                    { editing = i; dialog = true },
-                    { store.deleteIncome(i.id) })
+            itemsIndexed(list, key = { _, i -> i.id }) { index, i ->
+                PortfolioReveal(index) {
+                    IncomeCard(i,
+                        { editing = i; dialog = true },
+                        { store.deleteIncome(i.id) })
+                }
             }; if (list.isEmpty()) item { Empty("Brak dochodów.") }
         }
     }
@@ -1890,12 +2518,7 @@ fun IncomeDialog(initial: Income?, month: String, dismiss: () -> Unit, save: (In
         )
     }
     var date by remember {
-        mutableStateOf(
-            initial?.date ?: run {
-                val t = today()
-                if (monthOf(t) == month) t else "$month-01"
-            }
-        )
+        mutableStateOf(initial?.date ?: today())
     }
     var error by remember { mutableStateOf("") }
     var showDatePicker by remember { mutableStateOf(false) }
@@ -2109,14 +2732,19 @@ fun SettingsScreen(store: AppStore, back: () -> Unit) {
                         )
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button({ create.launch("Wydatki-backup.json") }) { Text("EKSPORTUJ") }
                             Button({
-                                open.launch(
-                                    arrayOf(
-                                        "application/json",
-                                        "text/*"
-                                    )
-                                )
+                                try {
+                                    create.launch("Wydatki-backup.json")
+                                } catch (e: Exception) {
+                                    message = "Brak menedżera plików na urządzeniu."
+                                }
+                            }) { Text("EKSPORTUJ") }
+                            Button({
+                                try {
+                                    open.launch(arrayOf("application/json", "text/*", "*/*"))
+                                } catch (e: Exception) {
+                                    message = "Brak menedżera plików na urządzeniu."
+                                }
                             }) { Text("IMPORTUJ") }
                         }
                         if (message.isNotBlank()) {
@@ -2172,14 +2800,24 @@ fun SettingsScreen(store: AppStore, back: () -> Unit) {
                             updateChecking = true
                             updateMessage = "Sprawdzanie…"
                             scope.launch {
-                                val release = GithubUpdater.check()
+                                val release = GithubUpdater.check(context)
                                 updateChecking = false
                                 if (release == null) {
                                     updateMessage =
                                         "Brak nowszej wersji lub nie skonfigurowano GitHub."
                                 } else {
+                                    val backupJson = store.exportJson()
+
+                                    // Ręczne wykrycie nowej wersji też uruchamia backup.
+                                    savePreUpdateJsonBackup(context, backupJson, release.tag)
+                                    saveAutomaticJsonBackup(context, backupJson)
+
+                                    scope.launch(Dispatchers.IO) {
+                                        FirebaseCloud.backupBeforeUpdate(store, backupJson)
+                                    }
+
                                     updateMessage =
-                                        "Dostępna wersja ${release.tag}. Wróć na ekran główny, aby rozpocząć aktualizację."
+                                        "Dostępna wersja ${release.tag}. Wykonano kopię zapasową."
                                 }
                             }
                         }) {
@@ -2415,16 +3053,8 @@ fun BottomBar(tab: (String) -> Unit, selected: String) {
 
 @Composable
 fun BottomItem(e: String, t: String, s: Boolean, on: () -> Unit) {
-    val iconSize by animateDpAsState(
-        targetValue = if (s) 24.dp else 20.dp,
-        animationSpec = androidx.compose.animation.core.tween(180),
-        label = "bottom_icon_size"
-    )
-    val textColor by animateColorAsState(
-        targetValue = if (s) Color(0xFF278B68) else Color.Gray,
-        animationSpec = androidx.compose.animation.core.tween(180),
-        label = "bottom_text_color"
-    )
+    val iconSize = if (s) 24.dp else 20.dp
+    val textColor = if (s) Color(0xFF278B68) else Color.Gray
     Column(
         Modifier.clickable(onClick = on).padding(horizontal = 10.dp),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -2483,27 +3113,99 @@ fun Empty(text: String) {
 }
 
 
-object UpdateRefreshBus {
-    @Volatile
-    var refreshRequested: Boolean = false
+fun showUpdateNotification(context: Context, tagName: String) {
+    try {
+        val prefs = context.getSharedPreferences("wydatki_update_prefs", Context.MODE_PRIVATE)
+        val lastNotified = prefs.getString("last_notified_version", "")
+        if (lastNotified == tagName) return
+        prefs.edit().putString("last_notified_version", tagName).commit()
 
-    @Volatile
-    var onRefresh: (() -> Unit)? = null
-        set(value) {
-            field = value
-            if (value != null && refreshRequested) {
-                refreshRequested = false
-                value()
+        val channelId = "app_updates_channel"
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Aktualizacje aplikacji",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Powiadomienia o dostępnych nowych wersjach aplikacji"
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                return
             }
         }
 
-    fun requestRefresh() {
-        refreshRequested = true
-        onRefresh?.let {
-            refreshRequested = false
-            it()
-        }
+        // Kliknięcie powiadomienia wraca do aplikacji.
+        // Aktualizacja jest pobierana i instalowana z poziomu aplikacji.
+        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            ?.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            ?: Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("Wydatki – dostępna aktualizacja")
+            .setContentText("Wydatki $tagName jest już dostępna.")
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        notificationManager.notify(1001, notification)
+    } catch (_: Exception) {}
+}
+
+
+private const val UPDATE_PREFS = "wydatki_update_prefs"
+private const val PREF_PENDING_UPDATE_TAG = "pending_update_tag"
+private const val PREF_PENDING_UPDATE_BEFORE_TIME = "pending_update_before_time"
+
+private fun installedUpdateTime(context: Context): Long {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.GINGERBREAD) return 0L
+    return try {
+        context.packageManager
+            .getPackageInfo(context.packageName, 0)
+            .lastUpdateTime
+    } catch (_: Exception) {
+        0L
     }
+}
+
+private fun rememberUpdateInstallStarted(context: Context, tag: String) {
+    context.getSharedPreferences(UPDATE_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(PREF_PENDING_UPDATE_TAG, tag)
+        .putLong(PREF_PENDING_UPDATE_BEFORE_TIME, installedUpdateTime(context))
+        .commit()
+}
+
+private fun updateWasInstalled(context: Context, tag: String): Boolean {
+    val prefs = context.getSharedPreferences(UPDATE_PREFS, Context.MODE_PRIVATE)
+    val pendingTag = prefs.getString(PREF_PENDING_UPDATE_TAG, null)
+    if (pendingTag != tag) return false
+
+    val beforeTime = prefs.getLong(PREF_PENDING_UPDATE_BEFORE_TIME, 0L)
+    val currentTime = installedUpdateTime(context)
+
+    if (beforeTime > 0L && currentTime > beforeTime) {
+        prefs.edit()
+            .remove(PREF_PENDING_UPDATE_TAG)
+            .remove(PREF_PENDING_UPDATE_BEFORE_TIME)
+            .commit()
+        return true
+    }
+
+    return false
 }
 
 object GithubUpdater {
@@ -2513,7 +3215,7 @@ object GithubUpdater {
     private val CURRENT_VERSION: String
         get() = BuildConfig.VERSION_NAME
 
-    suspend fun check(): ReleaseInfo? = withContext(Dispatchers.IO) {
+    suspend fun check(context: Context): ReleaseInfo? = withContext(Dispatchers.IO) {
         try {
             val c =
                 URL("https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest").openConnection() as HttpURLConnection
@@ -2522,6 +3224,12 @@ object GithubUpdater {
             c.setRequestProperty("Accept", "application/vnd.github+json")
             val o = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
             val tag = o.getString("tag_name").removePrefix("v")
+
+            // Po instalacji tego konkretnego APK nie pokazuj ponownie tej samej aktualizacji.
+            // Używamy lastUpdateTime, więc działa to nawet wtedy, gdy versionName w Gradle
+            // przypadkowo pozostał bez zmian.
+            if (updateWasInstalled(context, tag)) return@withContext null
+
             if (!isNewer(tag, CURRENT_VERSION)) return@withContext null
             val assets = o.optJSONArray("assets") ?: return@withContext null
             for (i in 0 until assets.length()) {
@@ -2562,7 +3270,7 @@ object GithubUpdater {
             connection.readTimeout = 15000
             connection.connect()
 
-            val total = connection.contentLengthLong
+            val total = connection.contentLength.toLong()
             var downloaded = 0L
 
             connection.inputStream.use { input ->
@@ -2612,8 +3320,6 @@ object GithubUpdater {
                         ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     )
                 }
-                // Nie zgłaszaj sukcesu: użytkownik musi wrócić do aplikacji po nadaniu zgody,
-                // a wtedy ponownie sprawdzimy rzeczywistą wersję.
                 return@withContext false
             }
 
@@ -2622,6 +3328,11 @@ object GithubUpdater {
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
+
+            // Zapamiętaj konkretną wersję dopiero tuż przed uruchomieniem instalatora.
+            // Przy anulowaniu instalacji znacznik nie zostanie uznany za zainstalowany,
+            // więc przy następnym uruchomieniu aktualizacja pojawi się ponownie.
+            rememberUpdateInstallStarted(context, release.tag)
 
             withContext(Dispatchers.Main) {
                 context.startActivity(intent)
