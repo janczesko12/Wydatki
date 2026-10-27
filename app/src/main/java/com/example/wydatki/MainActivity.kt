@@ -1421,11 +1421,19 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(back) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Wróć") }
-            Text(
-                "STATYSTYKI",
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold
-            )
+            Column {
+                Text(
+                    "STATYSTYKI",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = Color(0xFF173D2F)
+                )
+                Text(
+                    if (viewMode == "year") "Podsumowanie roczne" else "Analiza wybranego okresu",
+                    fontSize = 11.sp,
+                    color = Color(0xFF6B7C73)
+                )
+            }
             Spacer(Modifier.weight(1f))
             Row(
                 Modifier
@@ -1697,11 +1705,25 @@ fun StatisticsScreen(store: AppStore, month: String, setMonth: (String) -> Unit,
                                 Text(money(v), fontWeight = FontWeight.Bold)
                             }
                             Spacer(Modifier.height(5.dp))
-                            Text(
-                                "${if (displayTotal > 0) (v / displayTotal * 100).toInt() else 0}% wszystkich wydatków",
-                                fontSize = 12.sp,
-                                color = Color.Gray
-                            )
+                            val share = if (displayTotal > 0) (v / displayTotal).toFloat().coerceIn(0f, 1f) else 0f
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                LinearProgressIndicator(
+                                    progress = { share },
+                                    modifier = Modifier.weight(1f).height(7.dp).clip(RoundedCornerShape(8.dp)),
+                                    color = Color(0xFF278B68),
+                                    trackColor = Color(0xFFE6EEE9)
+                                )
+                                Text(
+                                    "${(share * 100).toInt()}%",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF278B68)
+                                )
+                            }
                         }
                     }
                 }
